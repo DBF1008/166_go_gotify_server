@@ -103,7 +103,7 @@ func (s *ManagerSuite) getConfForMockPlugin(uid uint) *model.PluginConf {
 
 func (s *ManagerSuite) getMockPluginInstance(uid uint) *mock.PluginInstance {
 	pid := s.getConfForMockPlugin(uid).ID
-	return s.manager.instances[pid].(*mock.PluginInstance)
+	return s.manager.states[pid].instance.(*mock.PluginInstance)
 }
 
 func (s *ManagerSuite) makeDanglingPluginConf(uid uint) *model.PluginConf {
@@ -315,6 +315,40 @@ func (s *ManagerSuite) TestRemoveUser_danglingConf_expectSuccess() {
 		Token:      auth.GenerateNotExistingToken(auth.GeneratePluginToken, s.manager.pluginConfExists),
 	})
 	assert.Nil(s.T(), s.manager.RemoveUser(9))
+}
+
+func (s *ManagerSuite) TestRemoveUser_DisableFail_clearsRegistryAndNoDrift() {
+	s.manager.initializeForUser(*s.db.NewUserWithName(20, "disable_fail_clear"))
+	mock.ReturnErrorOnDisableForUser(20, errors.New("test error"))
+
+	pid := s.getConfForMockPlugin(20).ID
+	assert.Nil(s.T(), s.manager.SetPluginEnabled(pid, true))
+	assert.True(s.T(), s.manager.HasInstance(pid))
+
+	// Teardown is best-effort: the disable error is surfaced, but every instance of the user is
+	// still unregistered so the registry never keeps a half-removed instance.
+	assert.EqualError(s.T(), s.manager.RemoveUser(20), "test error")
+	assert.False(s.T(), s.manager.HasInstance(pid), "instance must be unregistered even when disable fails")
+	assert.False(s.T(), s.manager.HasInstance(s.getConfForExamplePlugin(20).ID), "other instances of the user are cleared too")
+}
+
+func (s *ManagerSuite) TestReconcileInternalApps_idempotentAcrossReinit() {
+	s.db.User(21)
+	assert.Nil(s.T(), s.manager.InitializeForUserID(21))
+
+	conf := s.getConfForMockPlugin(21)
+	assert.NotZero(s.T(), conf.ApplicationID, "messenger plugin should own an application")
+
+	appInternal := func() bool {
+		app, err := s.db.GetApplicationByID(conf.ApplicationID)
+		assert.NoError(s.T(), err)
+		return app.Internal
+	}
+	assert.True(s.T(), appInternal(), "messenger plugin application should be internal")
+
+	// Reconciling again is idempotent: the internal flag stays true and does not drift.
+	assert.Nil(s.T(), s.manager.reconcileInternalApps(21))
+	assert.True(s.T(), appInternal(), "internal flag stays true on re-reconcile")
 }
 
 func (s *ManagerSuite) TestTriggerMessage() {

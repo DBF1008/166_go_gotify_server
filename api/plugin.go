@@ -11,7 +11,6 @@ import (
 	"github.com/gotify/server/v2/model"
 	"github.com/gotify/server/v2/plugin"
 	"github.com/gotify/server/v2/plugin/compat"
-	"gopkg.in/yaml.v3"
 )
 
 // The PluginDatabase interface for encapsulating database access.
@@ -385,22 +384,19 @@ func (c *PluginAPI) UpdateConfig(ctx *gin.Context) {
 			return
 		}
 
-		newConf := instance.DefaultConfig()
 		newconfBytes, err := io.ReadAll(ctx.Request.Body)
 		if err != nil {
 			ctx.AbortWithError(500, err)
 			return
 		}
-		if err := yaml.Unmarshal(newconfBytes, newConf); err != nil {
-			ctx.AbortWithError(400, err)
+		if err := c.Manager.SetConfig(id, newconfBytes); err != nil {
+			if errors.Is(err, plugin.ErrConfigPersistence) {
+				ctx.AbortWithError(500, err)
+			} else {
+				ctx.AbortWithError(400, err)
+			}
 			return
 		}
-		if err := instance.ValidateAndSetConfig(newConf); err != nil {
-			ctx.AbortWithError(400, err)
-			return
-		}
-		conf.Config = newconfBytes
-		successOrAbort(ctx, 500, c.DB.UpdatePluginConf(conf))
 	})
 }
 
