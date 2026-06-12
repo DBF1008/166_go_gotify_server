@@ -85,7 +85,7 @@ func (a *API) Notify(userID uint, msg *model.MessageExternal) {
 	defer a.lock.RUnlock()
 	if clients, ok := a.clients[userID]; ok {
 		for _, c := range clients {
-			c.write <- msg
+			c.enqueueOrClose(msg)
 		}
 	}
 }

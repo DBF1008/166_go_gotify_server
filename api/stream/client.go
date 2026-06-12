@@ -9,7 +9,8 @@ import (
 )
 
 const (
-	writeWait = 2 * time.Second
+	writeWait      = 2 * time.Second
+	writeChanBuffer = 128
 )
 
 var ping = func(conn *websocket.Conn) error {
@@ -32,7 +33,7 @@ type client struct {
 func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*client)) *client {
 	return &client{
 		conn:    conn,
-		write:   make(chan *model.MessageExternal, 1),
+		write:   make(chan *model.MessageExternal, writeChanBuffer),
 		userID:  userID,
 		token:   token,
 		onClose: onClose,
@@ -54,6 +55,21 @@ func (c *client) NotifyClose() {
 		close(c.write)
 		c.onClose(c)
 	})
+}
+
+// enqueueOrClose attempts a non-blocking send of msg into the write channel.
+// If the channel is full (slow consumer), the underlying connection is closed.
+// This causes the read goroutine to detect the error and call NotifyClose()
+// from its own goroutine, avoiding a deadlock with Notify()'s RLock.
+func (c *client) enqueueOrClose(msg *model.MessageExternal) {
+	select {
+	case c.write <- msg:
+	default:
+		// Slow consumer: close the raw connection. The read/write goroutines
+		// will detect the error and trigger NotifyClose() asynchronously.
+		log.Warn().Msgf("Closing slow WebSocket client for user %d (write buffer full)", c.userID)
+		c.conn.Close()
+	}
 }
 
 // startWriteHandler starts listening on the client connection. As we do not need anything from the client,
