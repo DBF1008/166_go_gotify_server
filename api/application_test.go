@@ -99,7 +99,7 @@ func (s *ApplicationSuite) Test_ensureApplicationHasCorrectJsonRepresentation() 
 		SortKey:     "a1",
 		CreatedAt:   testdb.Now,
 	}
-	test.JSONEquals(s.T(), actual, `{"id":1,"token":"Aasdasfgeeg","name":"myapp","description":"mydesc", "image": "asd", "internal":true, "defaultPriority":0, "createdAt":"2020-01-01T00:00:00Z", "lastUsed":null, "sortKey":"a1"}`)
+	test.JSONEquals(s.T(), actual, `{"id":1,"token":"Aasdasfgeeg","name":"myapp","description":"mydesc", "image": "asd", "internal":true, "defaultPriority":0, "defaultMessageExpirationSeconds":0, "createdAt":"2020-01-01T00:00:00Z", "lastUsed":null, "sortKey":"a1"}`)
 }
 
 func (s *ApplicationSuite) Test_CreateApplication_expectBadRequestOnEmptyName() {
@@ -710,4 +710,33 @@ func fakeImage(t *testing.T, path string) {
 	// Write data to dst
 	err = os.WriteFile(path, data, 0o644)
 	assert.Nil(t, err)
+}
+
+func (s *ApplicationSuite) Test_CreateApplication_withMessageExpiration() {
+	s.db.User(5)
+
+	test.WithUser(s.ctx, 5)
+	s.withFormData("name=custom_name&defaultMessageExpirationSeconds=3600")
+	s.a.CreateApplication(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	if app, err := s.db.GetApplicationByID(1); assert.NoError(s.T(), err) {
+		require.NotNil(s.T(), app)
+		assert.Equal(s.T(), uint(3600), app.DefaultMessageExpirationSeconds)
+	}
+}
+
+func (s *ApplicationSuite) Test_UpdateApplication_messageExpiration_expectSuccess() {
+	s.db.User(5).NewAppWithToken(2, "app-2")
+
+	test.WithUser(s.ctx, 5)
+	s.withFormData("name=new_name&defaultMessageExpirationSeconds=120")
+	s.ctx.Params = gin.Params{{Key: "id", Value: "2"}}
+	s.a.UpdateApplication(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	if app, err := s.db.GetApplicationByID(2); assert.NoError(s.T(), err) {
+		require.NotNil(s.T(), app)
+		assert.Equal(s.T(), uint(120), app.DefaultMessageExpirationSeconds)
+	}
 }

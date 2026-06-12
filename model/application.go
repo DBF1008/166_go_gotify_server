@@ -49,6 +49,13 @@ type Application struct {
 	// required: false
 	// example: 4
 	DefaultPriority int `form:"defaultPriority" query:"defaultPriority" json:"defaultPriority"`
+	// The default retention for messages sent by this application, in seconds.
+	// Messages older than this are automatically removed. 0 means messages from
+	// this application never expire. Defaults to 0.
+	//
+	// required: false
+	// example: 2592000
+	DefaultMessageExpirationSeconds uint `gorm:"default:0;not null" form:"defaultMessageExpirationSeconds" query:"defaultMessageExpirationSeconds" json:"defaultMessageExpirationSeconds"`
 	// The date the application was created.
 	//
 	// read only: true
@@ -65,4 +72,20 @@ type Application struct {
 	// required: true
 	// example: a1
 	SortKey string `gorm:"type:bytes;uniqueIndex:uix_application_user_id_sort_key,priority:2,length:255" form:"sortKey" query:"sortKey" json:"sortKey"`
+}
+
+// MessageExpiresAt returns the time at which a message dated `date` should
+// expire based on this application's retention setting, or nil when retention is
+// disabled (DefaultMessageExpirationSeconds == 0). If `date` is the zero value,
+// `now` is used as the reference instead.
+func (a *Application) MessageExpiresAt(date, now time.Time) *time.Time {
+	if a.DefaultMessageExpirationSeconds == 0 {
+		return nil
+	}
+	reference := date
+	if reference.IsZero() {
+		reference = now
+	}
+	expiry := reference.Add(time.Duration(a.DefaultMessageExpirationSeconds) * time.Second)
+	return &expiry
 }

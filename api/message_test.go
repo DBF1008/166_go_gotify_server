@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/gotify/server/v2/test"
 	"github.com/gotify/server/v2/test/testdb"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -656,4 +658,99 @@ func (s *MessageSuite) withURL(scheme, host, path, query string) {
 
 func intPtr(x int) *int {
 	return &x
+}
+
+func externalIDs(msgs []*model.MessageExternal) []uint {
+	result := make([]uint, len(msgs))
+	for i, m := range msgs {
+		result[i] = m.ID
+	}
+	return result
+}
+
+func (s *MessageSuite) Test_CreateMessage_setsExpiresAtFromAppRetention() {
+	timeNow = func() time.Time { return testdb.Now }
+	defer func() { timeNow = time.Now }()
+
+	auth.RegisterApplication(s.ctx, s.db.User(4).NewAppWithTokenAndExpiration(7, "app-token", 3600))
+	s.ctx.Request = httptest.NewRequest("POST", "/message", strings.NewReader(`{"title": "t", "message": "m"}`))
+	s.ctx.Request.Header.Set("Content-Type", "application/json")
+
+	s.a.CreateMessage(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	expiry := testdb.Now.Add(3600 * time.Second)
+	expected := &model.MessageExternal{ID: 1, ApplicationID: 7, Title: "t", Message: "m", Priority: intPtr(0), Date: testdb.Now, ExpiresAt: &expiry}
+
+	// The expiry derived from the app's retention is in the response body...
+	test.BodyEquals(s.T(), expected, s.recorder)
+	// ...and the realtime push carries the exact same expiry (consistency)...
+	assert.Equal(s.T(), expected, s.notifiedMessage)
+	// ...and the not-yet-expired message is visible via the read path.
+	if msgs, err := s.db.GetMessagesByApplication(7); assert.NoError(s.T(), err) {
+		assert.Len(s.T(), msgs, 1)
+		if assert.NotNil(s.T(), msgs[0].ExpiresAt) {
+			assert.Equal(s.T(), expiry.Unix(), msgs[0].ExpiresAt.Unix())
+		}
+	}
+}
+
+func (s *MessageSuite) Test_CreateMessage_noRetention_noExpiresAt() {
+	timeNow = func() time.Time { return testdb.Now }
+	defer func() { timeNow = time.Now }()
+
+	auth.RegisterApplication(s.ctx, s.db.User(4).NewAppWithToken(7, "app-token")) // retention disabled
+	s.ctx.Request = httptest.NewRequest("POST", "/message", strings.NewReader(`{"title": "t", "message": "m"}`))
+	s.ctx.Request.Header.Set("Content-Type", "application/json")
+
+	s.a.CreateMessage(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	expected := &model.MessageExternal{ID: 1, ApplicationID: 7, Title: "t", Message: "m", Priority: intPtr(0), Date: testdb.Now}
+	// expiresAt is omitted from the JSON (omitempty) and nil on the push.
+	test.BodyEquals(s.T(), expected, s.recorder)
+	assert.Equal(s.T(), expected, s.notifiedMessage)
+	assert.Nil(s.T(), s.notifiedMessage.ExpiresAt)
+}
+
+func (s *MessageSuite) Test_GetMessages_excludesExpired_pagingFromVisibleOnly() {
+	user := s.db.User(5)
+	app := user.App(1)
+	past := testdb.Now.Add(-time.Hour)
+	future := testdb.Now.Add(time.Hour)
+	// IDs 1..6: even ids expired (2,4,6), odd ids live (1,3,5).
+	for i := uint(1); i <= 6; i++ {
+		if i%2 == 0 {
+			app.NewMessageWithExpiration(i, past)
+		} else {
+			app.NewMessageWithExpiration(i, future)
+		}
+	}
+
+	s.withURL("http", "example.com", "/messages", "limit=2")
+	test.WithUser(s.ctx, 5)
+	s.a.GetMessages(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	var page1 model.PagedMessages
+	require.NoError(s.T(), json.Unmarshal(s.recorder.Body.Bytes(), &page1))
+	// Only live messages, and `next`/`since` are computed from the visible set.
+	assert.Equal(s.T(), []uint{5, 3}, externalIDs(page1.Messages))
+	assert.Equal(s.T(), 2, page1.Paging.Size)
+	assert.Equal(s.T(), uint(3), page1.Paging.Since)
+	assert.Contains(s.T(), page1.Paging.Next, "since=3")
+
+	// The next page contains only the remaining live message and has no successor.
+	s.recorder = httptest.NewRecorder()
+	s.ctx, _ = gin.CreateTestContext(s.recorder)
+	s.ctx.Request = httptest.NewRequest("GET", "/irrelevant", nil)
+	s.withURL("http", "example.com", "/messages", "limit=2&since=3")
+	test.WithUser(s.ctx, 5)
+	s.a.GetMessages(s.ctx)
+
+	var page2 model.PagedMessages
+	require.NoError(s.T(), json.Unmarshal(s.recorder.Body.Bytes(), &page2))
+	assert.Equal(s.T(), []uint{1}, externalIDs(page2.Messages))
+	assert.Equal(s.T(), 1, page2.Paging.Size)
+	assert.Empty(s.T(), page2.Paging.Next)
 }

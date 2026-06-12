@@ -50,6 +50,11 @@ type ApplicationParams struct {
 	//
 	// example: 5
 	DefaultPriority int `form:"defaultPriority" query:"defaultPriority" json:"defaultPriority"`
+	// The default retention for messages sent by this application, in seconds.
+	// 0 means messages from this application never expire.
+	//
+	// example: 2592000
+	DefaultMessageExpirationSeconds uint `form:"defaultMessageExpirationSeconds" query:"defaultMessageExpirationSeconds" json:"defaultMessageExpirationSeconds"`
 	// The sortKey for the application. Uses fractional indexing.
 	//
 	// example: a1
@@ -93,13 +98,14 @@ func (a *ApplicationAPI) CreateApplication(ctx *gin.Context) {
 	applicationParams := ApplicationParams{}
 	if err := ctx.Bind(&applicationParams); err == nil {
 		app := model.Application{
-			Name:            applicationParams.Name,
-			Description:     applicationParams.Description,
-			DefaultPriority: applicationParams.DefaultPriority,
-			SortKey:         applicationParams.SortKey,
-			Token:           auth.GenerateNotExistingToken(generateApplicationToken, a.applicationExists),
-			UserID:          auth.GetUserID(ctx),
-			Internal:        false,
+			Name:                            applicationParams.Name,
+			Description:                     applicationParams.Description,
+			DefaultPriority:                 applicationParams.DefaultPriority,
+			DefaultMessageExpirationSeconds: applicationParams.DefaultMessageExpirationSeconds,
+			SortKey:                         applicationParams.SortKey,
+			Token:                           auth.GenerateNotExistingToken(generateApplicationToken, a.applicationExists),
+			UserID:                          auth.GetUserID(ctx),
+			Internal:                        false,
 		}
 
 		if err := a.DB.CreateApplication(&app); err != nil {
@@ -261,6 +267,7 @@ func (a *ApplicationAPI) UpdateApplication(ctx *gin.Context) {
 				app.Description = applicationParams.Description
 				app.Name = applicationParams.Name
 				app.DefaultPriority = applicationParams.DefaultPriority
+				app.DefaultMessageExpirationSeconds = applicationParams.DefaultMessageExpirationSeconds
 				if applicationParams.SortKey != "" {
 					app.SortKey = applicationParams.SortKey
 				}

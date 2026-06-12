@@ -431,6 +431,7 @@ func toExternalMessage(msg *model.Message) *model.MessageExternal {
 		Title:         msg.Title,
 		Priority:      &msg.Priority,
 		Date:          msg.Date,
+		ExpiresAt:     msg.ExpiresAt,
 	}
 	if len(msg.Extras) != 0 {
 		res.Extras = make(map[string]interface{})

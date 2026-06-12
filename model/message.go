@@ -13,6 +13,10 @@ type Message struct {
 	Priority      int
 	Extras        []byte
 	Date          time.Time
+	// ExpiresAt is the time at which the message expires and may be removed, or
+	// nil if it never expires. It is derived from the application's retention
+	// setting when the message is created.
+	ExpiresAt *time.Time `gorm:"index"`
 }
 
 // MessageExternal Model
@@ -63,4 +67,10 @@ type MessageExternal struct {
 	// required: true
 	// example: 2018-02-27T19:36:10.5045044+01:00
 	Date time.Time `json:"date"`
+	// The date at which this message expires and may be removed. Null when the
+	// message never expires. Derived from the application's message retention.
+	//
+	// read only: true
+	// example: 2018-03-27T19:36:10.5045044+01:00
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 }

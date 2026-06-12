@@ -155,6 +155,19 @@ func (ab *AppClientBuilder) NewAppWithTokenAndDefaultPriority(id uint, token str
 	return application
 }
 
+// AppWithExpiration creates an application with a default message expiration (in seconds) and returns a message builder.
+func (ab *AppClientBuilder) AppWithExpiration(id uint, expirationSeconds uint) *MessageBuilder {
+	ab.NewAppWithTokenAndExpiration(id, "app"+fmt.Sprint(id), expirationSeconds)
+	return &MessageBuilder{db: ab.db, appID: id}
+}
+
+// NewAppWithTokenAndExpiration creates an application with a token and a default message expiration (in seconds) and returns the app.
+func (ab *AppClientBuilder) NewAppWithTokenAndExpiration(id uint, token string, expirationSeconds uint) *model.Application {
+	application := &model.Application{ID: id, UserID: ab.userID, Token: token, DefaultMessageExpirationSeconds: expirationSeconds}
+	ab.db.CreateApplication(application)
+	return application
+}
+
 // Client creates a client and returns itself.
 func (ab *AppClientBuilder) Client(id uint) *AppClientBuilder {
 	return ab.ClientWithToken(id, "client"+fmt.Sprint(id))
@@ -182,6 +195,19 @@ func (mb *MessageBuilder) Message(id uint) *MessageBuilder {
 // NewMessage creates a message and returns the message.
 func (mb *MessageBuilder) NewMessage(id uint) model.Message {
 	message := model.Message{ID: id, ApplicationID: mb.appID}
+	mb.db.CreateMessage(&message)
+	return message
+}
+
+// MessageWithExpiration creates a message with an explicit expiry and returns the builder.
+func (mb *MessageBuilder) MessageWithExpiration(id uint, expiresAt time.Time) *MessageBuilder {
+	mb.NewMessageWithExpiration(id, expiresAt)
+	return mb
+}
+
+// NewMessageWithExpiration creates a message with an explicit expiry and returns the message.
+func (mb *MessageBuilder) NewMessageWithExpiration(id uint, expiresAt time.Time) model.Message {
+	message := model.Message{ID: id, ApplicationID: mb.appID, ExpiresAt: &expiresAt}
 	mb.db.CreateMessage(&message)
 	return message
 }

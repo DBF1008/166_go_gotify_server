@@ -24,6 +24,12 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// messageCleanupInterval is how often expired messages are purged from the
+// database. Expired messages are also hidden from API responses immediately via
+// a read-time filter, so this interval only governs how quickly storage is
+// reclaimed.
+const messageCleanupInterval = time.Hour
+
 // Create creates the gin engine with all routes.
 func Create(db *database.GormDatabase, vInfo *model.VersionInfo, conf *config.Configuration) (*gin.Engine, func()) {
 	g := gin.New()
@@ -84,6 +90,10 @@ func Create(db *database.GormDatabase, vInfo *model.VersionInfo, conf *config.Co
 			}
 		}
 	}()
+
+	messageCleaner := newMessageCleaner(db, messageCleanupInterval, time.Now)
+	messageCleaner.start()
+
 	authentication := auth.Auth{DB: db, SecureCookie: conf.Server.SecureCookie}
 	messageHandler := api.MessageAPI{Notifier: streamHandler, DB: db}
 	healthHandler := api.HealthAPI{DB: db}
@@ -244,7 +254,10 @@ func Create(db *database.GormDatabase, vInfo *model.VersionInfo, conf *config.Co
 		authAdmin.GET("/:id", userHandler.GetUserByID)
 		authAdmin.POST("/:id", userHandler.UpdateUserByID)
 	}
-	return g, streamHandler.Close
+	return g, func() {
+		streamHandler.Close()
+		messageCleaner.close()
+	}
 }
 
 var tokenRegexp = regexp.MustCompile("token=[^&]+")

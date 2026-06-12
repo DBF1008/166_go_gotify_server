@@ -1,6 +1,8 @@
 package database
 
 import (
+	"time"
+
 	"github.com/gotify/server/v2/model"
 	"gorm.io/gorm"
 )
@@ -18,16 +20,24 @@ func (d *GormDatabase) GetMessageByID(id uint) (*model.Message, error) {
 	return nil, err
 }
 
-// CreateMessage creates a message.
+// CreateMessage creates a message. When the message has no expiry set, it is
+// derived from the owning application's retention setting
+// (Application.DefaultMessageExpirationSeconds).
 func (d *GormDatabase) CreateMessage(message *model.Message) error {
+	if message.ExpiresAt == nil {
+		if app, err := d.GetApplicationByID(message.ApplicationID); err == nil && app != nil {
+			message.ExpiresAt = app.MessageExpiresAt(message.Date, d.DB.NowFunc())
+		}
+	}
 	return d.DB.Create(message).Error
 }
 
 // GetMessagesByUser returns all messages from a user.
 func (d *GormDatabase) GetMessagesByUser(userID uint) ([]*model.Message, error) {
 	var messages []*model.Message
-	err := d.DB.Joins("JOIN applications ON applications.user_id = ?", userID).
-		Where("messages.application_id = applications.id").Order("messages.id desc").Find(&messages).Error
+	db := d.DB.Joins("JOIN applications ON applications.user_id = ?", userID).
+		Where("messages.application_id = applications.id").Order("messages.id desc")
+	err := d.messagesNotExpired(db).Find(&messages).Error
 	if err == gorm.ErrRecordNotFound {
 		err = nil
 	}
@@ -43,7 +53,7 @@ func (d *GormDatabase) GetMessagesByUserSince(userID uint, limit int, since uint
 	if since != 0 {
 		db = db.Where("messages.id < ?", since)
 	}
-	err := db.Find(&messages).Error
+	err := d.messagesNotExpired(db).Find(&messages).Error
 	if err == gorm.ErrRecordNotFound {
 		err = nil
 	}
@@ -53,7 +63,8 @@ func (d *GormDatabase) GetMessagesByUserSince(userID uint, limit int, since uint
 // GetMessagesByApplication returns all messages from an application.
 func (d *GormDatabase) GetMessagesByApplication(tokenID uint) ([]*model.Message, error) {
 	var messages []*model.Message
-	err := d.DB.Where("application_id = ?", tokenID).Order("messages.id desc").Find(&messages).Error
+	db := d.DB.Where("application_id = ?", tokenID).Order("messages.id desc")
+	err := d.messagesNotExpired(db).Find(&messages).Error
 	if err == gorm.ErrRecordNotFound {
 		err = nil
 	}
@@ -68,7 +79,7 @@ func (d *GormDatabase) GetMessagesByApplicationSince(appID uint, limit int, sinc
 	if since != 0 {
 		db = db.Where("messages.id < ?", since)
 	}
-	err := db.Find(&messages).Error
+	err := d.messagesNotExpired(db).Find(&messages).Error
 	if err == gorm.ErrRecordNotFound {
 		err = nil
 	}
@@ -92,4 +103,18 @@ func (d *GormDatabase) DeleteMessagesByUser(userID uint) error {
 		d.DeleteMessagesByApplication(app.ID)
 	}
 	return nil
+}
+
+// CleanupExpiredMessages deletes all messages whose expiry has passed and
+// returns the number of deleted messages. Messages without an expiry are never
+// removed.
+func (d *GormDatabase) CleanupExpiredMessages(now time.Time) (int64, error) {
+	res := d.DB.Where("expires_at IS NOT NULL AND expires_at <= ?", now).Delete(&model.Message{})
+	return res.RowsAffected, res.Error
+}
+
+// messagesNotExpired scopes a query to messages that have not yet expired. The
+// column is qualified because some queries join the applications table.
+func (d *GormDatabase) messagesNotExpired(tx *gorm.DB) *gorm.DB {
+	return tx.Where("messages.expires_at IS NULL OR messages.expires_at > ?", d.DB.NowFunc())
 }
