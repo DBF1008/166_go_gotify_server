@@ -1,6 +1,8 @@
 package database
 
 import (
+	"encoding/json"
+
 	"github.com/gotify/server/v2/model"
 	"gorm.io/gorm"
 )
@@ -92,4 +94,54 @@ func (d *GormDatabase) DeleteMessagesByUser(userID uint) error {
 		d.DeleteMessagesByApplication(app.ID)
 	}
 	return nil
+}
+
+// GetMessagesByUserAfter returns messages for the given user with ID > since,
+// ordered by ID ascending. Used for cursor-based replay on WebSocket reconnect.
+func (d *GormDatabase) GetMessagesByUserAfter(userID uint, since uint) ([]*model.MessageExternal, error) {
+	var messages []*model.Message
+	err := d.DB.Joins("JOIN applications ON applications.user_id = ?", userID).
+		Where("messages.application_id = applications.id").
+		Where("messages.id > ?", since).
+		Order("messages.id asc").
+		Find(&messages).Error
+	if err == gorm.ErrRecordNotFound {
+		err = nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*model.MessageExternal, len(messages))
+	for i, msg := range messages {
+		result[i] = toExternalMessage(msg)
+	}
+	return result, nil
+}
+
+// MessageExistsForUser checks whether a message with the given ID exists
+// and belongs to an application owned by the specified user.
+func (d *GormDatabase) MessageExistsForUser(userID uint, messageID uint) (bool, error) {
+	var count int64
+	err := d.DB.Model(&model.Message{}).
+		Joins("JOIN applications ON applications.user_id = ?", userID).
+		Where("messages.application_id = applications.id").
+		Where("messages.id = ?", messageID).
+		Count(&count).Error
+	return count > 0, err
+}
+
+func toExternalMessage(msg *model.Message) *model.MessageExternal {
+	res := &model.MessageExternal{
+		ID:            msg.ID,
+		ApplicationID: msg.ApplicationID,
+		Message:       msg.Message,
+		Title:         msg.Title,
+		Priority:      &msg.Priority,
+		Date:          msg.Date,
+	}
+	if len(msg.Extras) != 0 {
+		res.Extras = make(map[string]interface{})
+		json.Unmarshal(msg.Extras, &res.Extras)
+	}
+	return res
 }

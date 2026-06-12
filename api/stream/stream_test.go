@@ -592,7 +592,7 @@ func bootTestServer(handlerFunc gin.HandlerFunc) (*httptest.Server, *API) {
 	r := gin.New()
 	r.Use(handlerFunc)
 	// ping every 500 ms, and the client has 500 ms to respond
-	api := New(500*time.Millisecond, 500*time.Millisecond, []string{})
+	api := New(500*time.Millisecond, 500*time.Millisecond, []string{}, nil)
 
 	r.GET("/", api.Handle)
 	server := httptest.NewServer(r)

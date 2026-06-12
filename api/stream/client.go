@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -27,15 +28,58 @@ type client struct {
 	userID  uint
 	token   string
 	once    once
+
+	// writeMu serializes WebSocket writes between the replay loop (Handle)
+	// and the write handler goroutine.
+	writeMu sync.Mutex
+
+	// replaying is closed when the replay phase finishes (or immediately if
+	// no replay is needed). While open, the write handler deduplicates
+	// messages from the channel against the replay watermark.
+	replaying chan struct{}
+
+	// lastSentID tracks the highest message ID already sent during replay.
+	lastSentID uint
+	lastSentMu sync.Mutex
 }
 
 func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*client)) *client {
 	return &client{
-		conn:    conn,
-		write:   make(chan *model.MessageExternal, 1),
-		userID:  userID,
-		token:   token,
-		onClose: onClose,
+		conn:      conn,
+		write:     make(chan *model.MessageExternal, 16),
+		replaying: make(chan struct{}),
+		userID:    userID,
+		token:     token,
+		onClose:   onClose,
+	}
+}
+
+// shouldSend returns true if the message has not been sent yet (ID > lastSentID)
+// and atomically updates the watermark. Thread-safe.
+func (c *client) shouldSend(msg *model.MessageExternal) bool {
+	c.lastSentMu.Lock()
+	defer c.lastSentMu.Unlock()
+	if msg.ID <= c.lastSentID {
+		return false
+	}
+	c.lastSentID = msg.ID
+	return true
+}
+
+// setLastSentID sets the deduplication watermark after replay completes.
+func (c *client) setLastSentID(id uint) {
+	c.lastSentMu.Lock()
+	c.lastSentID = id
+	c.lastSentMu.Unlock()
+}
+
+// finishReplay signals that the replay phase is complete. After this the write
+// handler forwards all messages without dedup. Safe to call multiple times.
+func (c *client) finishReplay() {
+	select {
+	case <-c.replaying:
+	default:
+		close(c.replaying)
 	}
 }
 
@@ -56,7 +100,7 @@ func (c *client) NotifyClose() {
 	})
 }
 
-// startWriteHandler starts listening on the client connection. As we do not need anything from the client,
+// startReading starts listening on the client connection. As we do not need anything from the client,
 // we ignore incoming messages. Leaves the loop on errors.
 func (c *client) startReading(pongWait time.Duration) {
 	defer c.NotifyClose()
@@ -78,6 +122,9 @@ func (c *client) startReading(pongWait time.Duration) {
 // * ping the client in the interval provided as parameter
 // * write messages send by the channel to the client
 // * on errors exit the loop.
+//
+// During the replay phase messages from the channel are deduplicated against
+// the replay watermark; after replay all messages are forwarded directly.
 func (c *client) startWriteHandler(pingPeriod time.Duration) {
 	pingTicker := time.NewTicker(pingPeriod)
 	defer func() {
@@ -92,14 +139,31 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 				return
 			}
 
+			// During replay: deduplicate against the watermark.
+			// After replay: always forward.
+			select {
+			case <-c.replaying:
+				// replay done, no dedup
+			default:
+				if !c.shouldSend(message) {
+					continue
+				}
+			}
+
+			c.writeMu.Lock()
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := writeJSON(c.conn, message); err != nil {
+			err := writeJSON(c.conn, message)
+			c.writeMu.Unlock()
+			if err != nil {
 				printWebSocketError("WriteError", err)
 				return
 			}
 		case <-pingTicker.C:
+			c.writeMu.Lock()
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := ping(c.conn); err != nil {
+			err := ping(c.conn)
+			c.writeMu.Unlock()
+			if err != nil {
 				printWebSocketError("PingError", err)
 				return
 			}

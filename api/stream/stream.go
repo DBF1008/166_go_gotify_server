@@ -1,9 +1,11 @@
 package stream
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/gotify/server/v2/auth"
 	"github.com/gotify/server/v2/mode"
 	"github.com/gotify/server/v2/model"
+	"github.com/rs/zerolog/log"
 )
 
 // The API provides a handler for a WebSocket stream API.
@@ -22,18 +25,22 @@ type API struct {
 	pingPeriod  time.Duration
 	pongTimeout time.Duration
 	upgrader    *websocket.Upgrader
+	// fetcher retrieves messages for cursor-based replay. May be nil to disable replay.
+	fetcher MessageFetcher
 }
 
 // New creates a new instance of API.
 // pingPeriod: is the interval, in which is server sends the a ping to the client.
 // pongTimeout: is the duration after the connection will be terminated, when the client does not respond with the
 // pong command.
-func New(pingPeriod, pongTimeout time.Duration, allowedWebSocketOrigins []string) *API {
+// fetcher: optional MessageFetcher for cursor-based replay. Pass nil to disable replay.
+func New(pingPeriod, pongTimeout time.Duration, allowedWebSocketOrigins []string, fetcher MessageFetcher) *API {
 	return &API{
 		clients:     make(map[uint][]*client),
 		pingPeriod:  pingPeriod,
 		pongTimeout: pingPeriod + pongTimeout,
 		upgrader:    newUpgrader(allowedWebSocketOrigins),
+		fetcher:     fetcher,
 	}
 }
 
@@ -141,6 +148,37 @@ func (a *API) register(client *client) {
 //	    schema:
 //	        $ref: "#/definitions/Error"
 func (a *API) Handle(ctx *gin.Context) {
+	userID := auth.GetUserID(ctx)
+
+	// Parse and validate cursor BEFORE upgrading to WebSocket.
+	var cursor uint
+	if cursorParam := ctx.Query("lastMessageID"); cursorParam != "" {
+		parsed, err := strconv.ParseUint(cursorParam, 10, 64)
+		if err != nil || parsed == 0 {
+			ctx.AbortWithError(http.StatusBadRequest,
+				fmt.Errorf("invalid lastMessageID parameter: %s", cursorParam))
+			return
+		}
+		cursor = uint(parsed)
+
+		if a.fetcher == nil {
+			ctx.AbortWithError(http.StatusServiceUnavailable,
+				fmt.Errorf("replay not available"))
+			return
+		}
+
+		exists, err := a.fetcher.MessageExistsForUser(userID, cursor)
+		if err != nil {
+			ctx.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
+		if !exists {
+			ctx.AbortWithError(http.StatusNotFound,
+				fmt.Errorf("message %d not found or does not belong to user", cursor))
+			return
+		}
+	}
+
 	conn, err := a.upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
 		ctx.Error(err)
@@ -151,10 +189,55 @@ func (a *API) Handle(ctx *gin.Context) {
 	if c := auth.GetClient(ctx); c != nil {
 		token = c.Token
 	}
-	client := newClient(conn, auth.GetUserID(ctx), token, a.remove)
-	a.register(client)
-	go client.startReading(a.pongTimeout)
-	go client.startWriteHandler(a.pingPeriod)
+	cl := newClient(conn, userID, token, a.remove)
+
+	// If no replay is needed, signal immediately so the write handler
+	// forwards all messages without dedup.
+	if cursor == 0 || a.fetcher == nil {
+		cl.finishReplay()
+	}
+
+	// Register FIRST so that no Notify messages are missed during replay.
+	a.register(cl)
+
+	// Start read/write goroutines before replay so that Notify has a consumer.
+	go cl.startReading(a.pongTimeout)
+	go cl.startWriteHandler(a.pingPeriod)
+
+	// Replay historical messages if a valid cursor was provided.
+	if cursor > 0 && a.fetcher != nil {
+		msgs, err := a.fetcher.GetMessagesByUserAfter(userID, cursor)
+		if err != nil {
+			log.Error().Err(err).Uint("userID", userID).Uint("cursor", cursor).
+				Msg("replay fetch failed, client continues with live stream only")
+		} else {
+			var maxReplayedID uint
+			for _, msg := range msgs {
+				// Only send messages that pass the dedup check.
+				if !cl.shouldSend(msg) {
+					continue
+				}
+				cl.writeMu.Lock()
+				cl.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				err := writeJSON(cl.conn, msg)
+				cl.writeMu.Unlock()
+				if err != nil {
+					printWebSocketError("ReplayWriteError", err)
+					cl.NotifyClose()
+					return
+				}
+				if msg.ID > maxReplayedID {
+					maxReplayedID = msg.ID
+				}
+			}
+			// Update watermark so the write handler deduplicates subsequent messages.
+			if maxReplayedID > 0 {
+				cl.setLastSentID(maxReplayedID)
+			}
+		}
+		// Replay complete — write handler stops dedup from now on.
+		cl.finishReplay()
+	}
 }
 
 // Close closes all client connections and stops answering new connections.
