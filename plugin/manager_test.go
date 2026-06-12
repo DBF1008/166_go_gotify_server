@@ -103,7 +103,7 @@ func (s *ManagerSuite) getConfForMockPlugin(uid uint) *model.PluginConf {
 
 func (s *ManagerSuite) getMockPluginInstance(uid uint) *mock.PluginInstance {
 	pid := s.getConfForMockPlugin(uid).ID
-	return s.manager.instances[pid].(*mock.PluginInstance)
+	return s.manager.instances[pid].Instance.(*mock.PluginInstance)
 }
 
 func (s *ManagerSuite) makeDanglingPluginConf(uid uint) *model.PluginConf {
@@ -296,7 +296,9 @@ func (s *ManagerSuite) TestRemoveUser_DisableFail_cannotRemove() {
 	mock.ReturnErrorOnDisableForUser(8, errExpected)
 	s.manager.SetPluginEnabled(s.getConfForMockPlugin(8).ID, true)
 
-	assert.EqualError(s.T(), s.manager.RemoveUser(8), errExpected.Error())
+	err := s.manager.RemoveUser(8)
+	assert.Error(s.T(), err)
+	assert.Contains(s.T(), err.Error(), "test error")
 }
 
 func (s *ManagerSuite) TestRemoveUser_danglingConf_expectSuccess() {

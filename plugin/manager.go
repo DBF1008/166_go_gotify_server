@@ -43,10 +43,56 @@ type Notifier interface {
 	Notify(userID uint, message *model.MessageExternal)
 }
 
+// InstanceState represents the lifecycle state of a plugin instance.
+type InstanceState int
+
+const (
+	// StateLoaded means the .so file has been loaded but no per-user instance exists yet.
+	StateLoaded InstanceState = iota
+	// StateInitialized means the instance has been created, handlers wired, and config validated.
+	StateInitialized
+	// StateEnabled means Enable() was called successfully.
+	StateEnabled
+	// StateDisabled means Disable() was called successfully, or the plugin was never enabled.
+	StateDisabled
+	// StateFailed means Enable() or config validation failed.
+	StateFailed
+	// StateRemoved means the instance has been cleaned up (user deleted).
+	StateRemoved
+)
+
+func (s InstanceState) String() string {
+	switch s {
+	case StateLoaded:
+		return "loaded"
+	case StateInitialized:
+		return "initialized"
+	case StateEnabled:
+		return "enabled"
+	case StateDisabled:
+		return "disabled"
+	case StateFailed:
+		return "failed"
+	case StateRemoved:
+		return "removed"
+	default:
+		return "unknown"
+	}
+}
+
+// ManagedInstance wraps a compat.PluginInstance with lifecycle state tracking.
+type ManagedInstance struct {
+	Instance   compat.PluginInstance
+	State      InstanceState
+	ConfID     uint
+	ModulePath string
+	UserID     uint
+}
+
 // Manager is an encapsulating layer for plugins and manages all plugins and its instances.
 type Manager struct {
 	mutex     *sync.RWMutex
-	instances map[uint]compat.PluginInstance
+	instances map[uint]*ManagedInstance
 	plugins   map[string]compat.Plugin
 	messages  chan MessageWithUserID
 	db        Database
@@ -57,7 +103,7 @@ type Manager struct {
 func NewManager(db Database, directory string, mux *gin.RouterGroup, notifier Notifier) (*Manager, error) {
 	manager := &Manager{
 		mutex:     &sync.RWMutex{},
-		instances: map[uint]compat.PluginInstance{},
+		instances: map[uint]*ManagedInstance{},
 		plugins:   map[string]compat.Plugin{},
 		messages:  make(chan MessageWithUserID),
 		db:        db,
@@ -115,7 +161,7 @@ func (m *Manager) pluginConfExists(token string) bool {
 
 // SetPluginEnabled sets the plugins enabled state.
 func (m *Manager) SetPluginEnabled(pluginID uint, enabled bool) error {
-	instance, err := m.Instance(pluginID)
+	managed, err := m.ManagedInstanceByID(pluginID)
 	if err != nil {
 		return errors.New("instance not found")
 	}
@@ -131,6 +177,7 @@ func (m *Manager) SetPluginEnabled(pluginID uint, enabled bool) error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
+	instance := managed.Instance
 	if enabled {
 		err = instance.Enable()
 	} else {
@@ -144,7 +191,22 @@ func (m *Manager) SetPluginEnabled(pluginID uint, enabled bool) error {
 		conf = newConf
 	}
 	conf.Enabled = enabled
-	return m.db.UpdatePluginConf(conf)
+	if dbErr := m.db.UpdatePluginConf(conf); dbErr != nil {
+		// Rollback: undo the runtime change to keep runtime and DB in sync.
+		if enabled {
+			instance.Disable()
+		} else {
+			instance.Enable()
+		}
+		return dbErr
+	}
+
+	if enabled {
+		managed.State = StateEnabled
+	} else {
+		managed.State = StateDisabled
+	}
+	return nil
 }
 
 // PluginInfo returns plugin info.
@@ -168,10 +230,32 @@ func (m *Manager) Instance(pluginID uint) (compat.PluginInstance, error) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	if instance, ok := m.instances[pluginID]; ok {
-		return instance, nil
+	if managed, ok := m.instances[pluginID]; ok {
+		return managed.Instance, nil
 	}
 	return nil, errors.New("instance not found")
+}
+
+// ManagedInstanceByID returns the managed instance wrapper for the given plugin ID.
+func (m *Manager) ManagedInstanceByID(pluginID uint) (*ManagedInstance, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	if managed, ok := m.instances[pluginID]; ok {
+		return managed, nil
+	}
+	return nil, errors.New("instance not found")
+}
+
+// InstanceState returns the current lifecycle state of the given plugin instance.
+func (m *Manager) InstanceState(pluginID uint) (InstanceState, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	if managed, ok := m.instances[pluginID]; ok {
+		return managed.State, nil
+	}
+	return StateLoaded, errors.New("instance not found")
 }
 
 // HasInstance returns whether the given plugin ID has a corresponding instance.
@@ -180,29 +264,46 @@ func (m *Manager) HasInstance(pluginID uint) bool {
 	return err == nil && instance != nil
 }
 
-// RemoveUser disabled all plugins of a user when the user is disabled.
+// RemoveUser disables all plugins of a user when the user is disabled.
+// It is best-effort: errors are collected but do not prevent cleanup of remaining plugins.
 func (m *Manager) RemoveUser(userID uint) error {
+	var errs []error
+
 	for _, p := range m.plugins {
 		pluginConf, err := m.db.GetPluginConfByUserAndPath(userID, p.PluginInfo().ModulePath)
 		if err != nil {
-			return err
+			errs = append(errs, err)
+			continue
 		}
 		if pluginConf == nil {
 			continue
 		}
-		if pluginConf.Enabled {
-			inst, err := m.Instance(pluginConf.ID)
-			if err != nil {
-				continue
-			}
+		managed, ok := m.instances[pluginConf.ID]
+		if !ok {
+			continue
+		}
+		if managed.State == StateEnabled {
 			m.mutex.Lock()
-			err = inst.Disable()
+			err = managed.Instance.Disable()
 			m.mutex.Unlock()
 			if err != nil {
-				return err
+				errs = append(errs, fmt.Errorf("disable plugin %d: %w", pluginConf.ID, err))
+				managed.State = StateFailed
+			} else {
+				managed.State = StateDisabled
 			}
 		}
+		managed.State = StateRemoved
 		delete(m.instances, pluginConf.ID)
+	}
+
+	// Reconcile internal application flags after removing user's plugins.
+	if recErr := m.reconcileInternalApps(userID); recErr != nil {
+		errs = append(errs, recErr)
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during user removal: %v", errs)
 	}
 	return nil
 }
@@ -291,7 +392,15 @@ func (m *Manager) initializeForUser(user model.User) error {
 		}
 	}
 
-	apps, err := m.db.GetApplicationsByUser(user.ID)
+	return m.reconcileInternalApps(user.ID)
+}
+
+// reconcileInternalApps synchronizes the Internal flag on all applications
+// belonging to the given user. An application is marked Internal=true if it has
+// a PluginConf whose ModulePath corresponds to a currently loaded plugin;
+// otherwise it is set to Internal=false.
+func (m *Manager) reconcileInternalApps(userID uint) error {
+	apps, err := m.db.GetApplicationsByUser(userID)
 	if err != nil {
 		return err
 	}
@@ -300,15 +409,18 @@ func (m *Manager) initializeForUser(user model.User) error {
 		if err != nil {
 			return err
 		}
+		shouldBeInternal := false
 		if conf != nil {
 			_, compatExist := m.plugins[conf.ModulePath]
-			app.Internal = compatExist
-		} else {
-			app.Internal = false
+			shouldBeInternal = compatExist
 		}
-		m.db.UpdateApplication(app)
+		if app.Internal != shouldBeInternal {
+			app.Internal = shouldBeInternal
+			if err := m.db.UpdateApplication(app); err != nil {
+				return err
+			}
+		}
 	}
-
 	return nil
 }
 
@@ -330,7 +442,14 @@ func (m *Manager) initializeSingleUserPlugin(userCtx compat.UserContext, p compa
 		}
 	}
 
-	m.instances[pluginConf.ID] = instance
+	managed := &ManagedInstance{
+		Instance:   instance,
+		State:      StateInitialized,
+		ConfID:     pluginConf.ID,
+		ModulePath: info.ModulePath,
+		UserID:     userID,
+	}
+	m.instances[pluginConf.ID] = managed
 
 	if compat.HasSupport(instance, compat.Messenger) {
 		instance.SetMessageHandler(redirectToChannel{
@@ -343,27 +462,35 @@ func (m *Manager) initializeSingleUserPlugin(userCtx compat.UserContext, p compa
 		instance.SetStorageHandler(dbStorageHandler{pluginConf.ID, m.db})
 	}
 	if compat.HasSupport(instance, compat.Configurer) {
-		m.initializeConfigurerForSingleUserPlugin(instance, pluginConf)
+		m.initializeConfigurerForSingleUserPlugin(managed, instance, pluginConf)
 	}
 	if compat.HasSupport(instance, compat.Webhooker) {
 		id := pluginConf.ID
 		g := m.mux.Group(pluginConf.Token+"/", requirePluginEnabled(id, m.db))
 		instance.RegisterWebhook(strings.Replace(g.BasePath(), ":id", strconv.Itoa(int(id)), 1), g)
 	}
-	if pluginConf.Enabled {
+	if pluginConf.Enabled && managed.State != StateFailed {
 		err := instance.Enable()
 		if err != nil {
 			// Single user plugin cannot be enabled
 			// Don't panic, disable for now and wait for user to update config
-			log.Warn().Err(err).Str("user", userCtx.Name).Msg("Plugin initialize failed, disabling now")
+			log.Warn().Err(err).
+				Str("user", userCtx.Name).
+				Str("module_path", info.ModulePath).
+				Msg("Plugin initialize failed, disabling now")
+			managed.State = StateFailed
 			pluginConf.Enabled = false
 			m.db.UpdatePluginConf(pluginConf)
+		} else {
+			managed.State = StateEnabled
 		}
+	} else if managed.State != StateFailed {
+		managed.State = StateDisabled
 	}
 	return nil
 }
 
-func (m *Manager) initializeConfigurerForSingleUserPlugin(instance compat.PluginInstance, pluginConf *model.PluginConf) {
+func (m *Manager) initializeConfigurerForSingleUserPlugin(managed *ManagedInstance, instance compat.PluginInstance, pluginConf *model.PluginConf) {
 	if len(pluginConf.Config) == 0 {
 		// The Configurer is newly implemented
 		// Use the default config
@@ -372,6 +499,7 @@ func (m *Manager) initializeConfigurerForSingleUserPlugin(instance compat.Plugin
 	}
 	c := instance.DefaultConfig()
 	if yaml.Unmarshal(pluginConf.Config, c) != nil || instance.ValidateAndSetConfig(c) != nil {
+		managed.State = StateFailed
 		pluginConf.Enabled = false
 
 		log.Warn().
@@ -395,7 +523,14 @@ func (m *Manager) initializeConfigurerForSingleUserPlugin(instance compat.Plugin
 		pluginConf.Config = newConf.Bytes()
 
 		m.db.UpdatePluginConf(pluginConf)
-		instance.ValidateAndSetConfig(instance.DefaultConfig())
+
+		defaultConfig := instance.DefaultConfig()
+		if err := instance.ValidateAndSetConfig(defaultConfig); err != nil {
+			log.Error().Err(err).
+				Str("module_path", pluginConf.ModulePath).
+				Uint("user_id", pluginConf.UserID).
+				Msg("Default config also rejected, plugin marked as failed")
+		}
 	}
 }
 
