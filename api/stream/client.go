@@ -10,6 +10,14 @@ import (
 
 const (
 	writeWait = 2 * time.Second
+
+	// messageBufferSize is the number of messages buffered per client before the
+	// client is considered too slow. The buffer absorbs short write bursts; once
+	// it overflows the client is disconnected (see client.enqueue) so that a
+	// single slow or suspended connection cannot block message dispatch for the
+	// other clients. Disconnected clients reconnect and fetch any missed messages
+	// through the REST API.
+	messageBufferSize = 16
 )
 
 var ping = func(conn *websocket.Conn) error {
@@ -24,6 +32,7 @@ type client struct {
 	conn    *websocket.Conn
 	onClose func(*client)
 	write   chan *model.MessageExternal
+	closing chan struct{}
 	userID  uint
 	token   string
 	once    once
@@ -32,7 +41,8 @@ type client struct {
 func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*client)) *client {
 	return &client{
 		conn:    conn,
-		write:   make(chan *model.MessageExternal, 1),
+		write:   make(chan *model.MessageExternal, messageBufferSize),
+		closing: make(chan struct{}),
 		userID:  userID,
 		token:   token,
 		onClose: onClose,
@@ -43,7 +53,7 @@ func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*cl
 func (c *client) Close() {
 	c.once.Do(func() {
 		c.conn.Close()
-		close(c.write)
+		close(c.closing)
 	})
 }
 
@@ -51,9 +61,24 @@ func (c *client) Close() {
 func (c *client) NotifyClose() {
 	c.once.Do(func() {
 		c.conn.Close()
-		close(c.write)
+		close(c.closing)
 		c.onClose(c)
 	})
+}
+
+// enqueue hands a message to the client's write loop without ever blocking the
+// caller. If the buffer is full the client is not keeping up (e.g. a slow network
+// or a suspended browser tab), so it is disconnected instead of stalling dispatch
+// for the other clients; it will reconnect and fetch missed messages via the REST
+// API. Callers must not hold the API lock, as a disconnect acquires it.
+func (c *client) enqueue(msg *model.MessageExternal) {
+	select {
+	case c.write <- msg:
+	case <-c.closing:
+		// Already shutting down; nothing to deliver.
+	default:
+		c.NotifyClose()
+	}
 }
 
 // startWriteHandler starts listening on the client connection. As we do not need anything from the client,
@@ -87,11 +112,7 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 
 	for {
 		select {
-		case message, ok := <-c.write:
-			if !ok {
-				return
-			}
-
+		case message := <-c.write:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := writeJSON(c.conn, message); err != nil {
 				printWebSocketError("WriteError", err)
@@ -103,6 +124,8 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 				printWebSocketError("PingError", err)
 				return
 			}
+		case <-c.closing:
+			return
 		}
 	}
 }

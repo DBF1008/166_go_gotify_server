@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -617,4 +618,324 @@ func waitForConnectedClients(api *API, count int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// --- regression coverage: a single slow / suspended connection must not block
+// message dispatch, client deletion or expired-client cleanup ---
+
+// slowWriter hijacks writeJSON so that the first client the server writes to
+// behaves like a slow or suspended consumer: its writes block until release is
+// called, while every other client is written normally. Connect the slow client
+// first and prime it (a single Notify) before connecting any other client, so it
+// is the connection that gets captured.
+// slowWriter makes the first client the server writes to behave like a slow or
+// suspended consumer: its writes block until release is called, while every other
+// client is written normally. Connect the slow client first and prime it (a single
+// Notify) before connecting any other client, so it is the connection captured.
+//
+// The writeJSON test seam is a package-global function, so it is installed exactly
+// once (lazily, before any client exists and can read it) and per-test control is
+// routed through the mutex-guarded activeSlow pointer. This keeps teardown free of
+// a data race on writeJSON while client write loops are still running.
+type slowWriter struct {
+	mu          sync.Mutex
+	conn        *websocket.Conn
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+var (
+	slowSeamOnce  sync.Once
+	realWriteJSON func(*websocket.Conn, interface{}) error
+	slowMu        sync.Mutex
+	activeSlow    *slowWriter
+)
+
+func installSlowSeam() {
+	slowSeamOnce.Do(func() {
+		realWriteJSON = writeJSON
+		writeJSON = func(conn *websocket.Conn, v interface{}) error {
+			slowMu.Lock()
+			sw := activeSlow
+			slowMu.Unlock()
+			if sw != nil {
+				sw.mu.Lock()
+				if sw.conn == nil {
+					sw.conn = conn
+				}
+				blocked := conn == sw.conn
+				sw.mu.Unlock()
+				if blocked {
+					<-sw.release
+					return errors.New("slow client released")
+				}
+			}
+			return realWriteJSON(conn, v)
+		}
+	})
+}
+
+func newSlowWriter() *slowWriter {
+	installSlowSeam()
+	sw := &slowWriter{release: make(chan struct{})}
+	slowMu.Lock()
+	activeSlow = sw
+	slowMu.Unlock()
+	return sw
+}
+
+func (sw *slowWriter) captured() bool {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.conn != nil
+}
+
+// releaseAndRestore unblocks the slow client's writes and detaches this slowWriter.
+// It is safe to call multiple times and should be deferred so blocked write loops
+// can exit before leaktest runs.
+func (sw *slowWriter) releaseAndRestore() {
+	sw.releaseOnce.Do(func() { close(sw.release) })
+	slowMu.Lock()
+	if activeSlow == sw {
+		activeSlow = nil
+	}
+	slowMu.Unlock()
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// assertReturnsWithin fails the test if fn does not return within d, which is the
+// signal that fn is blocked (e.g. waiting on a lock held by a stuck dispatch).
+func assertReturnsWithin(t *testing.T, d time.Duration, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not return within %s; it is blocked", what, d)
+	}
+}
+
+func TestSlowClientIsDisconnectedWithoutBlockingDispatch(t *testing.T) {
+	mode.Set(mode.TestDev)
+	defer leaktest.Check(t)()
+
+	sw := newSlowWriter()
+	defer sw.releaseAndRestore()
+
+	userIDs := []uint{1, 2}
+	tokens := []string{"slow", "healthy"}
+	i := 0
+	server, api := bootTestServer(func(ctx *gin.Context) {
+		auth.RegisterClient(ctx, &model.Client{UserID: userIDs[i], Token: tokens[i]})
+		i++
+	})
+	defer server.Close()
+	defer api.Close()
+	url := wsURL(server.URL)
+
+	// Connect the slow consumer first and prime it so its write loop parks.
+	slow := testClient(t, url)
+	defer slow.conn.Close()
+	waitForConnectedClients(api, 1)
+	api.Notify(1, &model.MessageExternal{ID: 0, Message: "prime"})
+	waitFor(t, "slow client to be captured", sw.captured)
+
+	// A healthy client of a different user.
+	healthy := testClient(t, url)
+	defer healthy.conn.Close()
+	waitForConnectedClients(api, 2)
+
+	// Flooding the slow user well past its buffer must not block dispatch.
+	assertReturnsWithin(t, 2*time.Second, "Notify to a slow client", func() {
+		for n := 0; n < messageBufferSize*4; n++ {
+			api.Notify(1, &model.MessageExternal{ID: uint(n + 1), Message: "flood"})
+		}
+	})
+
+	// The other user keeps receiving while the slow client is stuck.
+	api.Notify(2, &model.MessageExternal{ID: 99, Message: "hi"})
+	healthy.expectMessage(&model.MessageExternal{ID: 99, Message: "hi"})
+
+	// The slow client is disconnected so it can no longer back up the pipeline.
+	waitForConnectedClients(api, 1)
+	assert.Empty(t, clients(api, 1))
+	assert.NotEmpty(t, clients(api, 2))
+}
+
+func TestSlowClientDoesNotDelaySameUser(t *testing.T) {
+	mode.Set(mode.TestDev)
+	defer leaktest.Check(t)()
+
+	sw := newSlowWriter()
+	defer sw.releaseAndRestore()
+
+	tokens := []string{"slow", "healthy"}
+	i := 0
+	server, api := bootTestServer(func(ctx *gin.Context) {
+		auth.RegisterClient(ctx, &model.Client{UserID: 1, Token: tokens[i]})
+		i++
+	})
+	defer server.Close()
+	defer api.Close()
+	url := wsURL(server.URL)
+
+	// Slow client of user 1, parked and first in the user's client list.
+	slow := testClient(t, url)
+	defer slow.conn.Close()
+	waitForConnectedClients(api, 1)
+	api.Notify(1, &model.MessageExternal{ID: 0, Message: "prime"})
+	waitFor(t, "slow client to be captured", sw.captured)
+
+	// A second, healthy client of the SAME user.
+	healthy := testClient(t, url)
+	defer healthy.conn.Close()
+	waitForConnectedClients(api, 2)
+
+	// Notifying the user must reach the healthy client immediately, even though
+	// an earlier client of the same user is stuck.
+	assertReturnsWithin(t, 2*time.Second, "Notify to a user with a slow client", func() {
+		api.Notify(1, &model.MessageExternal{ID: 1, Message: "fast"})
+	})
+	healthy.expectMessage(&model.MessageExternal{ID: 1, Message: "fast"})
+}
+
+func TestClientActiveDisconnectDoesNotBlock(t *testing.T) {
+	mode.Set(mode.TestDev)
+	defer leaktest.Check(t)()
+
+	userIDs := []uint{1, 1, 2}
+	tokens := []string{"1-a", "1-b", "2-a"}
+	i := 0
+	server, api := bootTestServer(func(ctx *gin.Context) {
+		auth.RegisterClient(ctx, &model.Client{UserID: userIDs[i], Token: tokens[i]})
+		i++
+	})
+	defer server.Close()
+	defer api.Close()
+	url := wsURL(server.URL)
+
+	userOneA := testClient(t, url)
+	defer userOneA.conn.Close()
+	userOneB := testClient(t, url)
+	defer userOneB.conn.Close()
+	userTwo := testClient(t, url)
+	defer userTwo.conn.Close()
+	waitForConnectedClients(api, 3)
+
+	// One client of user 1 actively disconnects (e.g. the browser tab is closed).
+	userOneA.conn.Close()
+	waitForConnectedClients(api, 2)
+
+	// Dispatch to the remaining clients still works and does not block.
+	assertReturnsWithin(t, 2*time.Second, "Notify after a client disconnected", func() {
+		api.Notify(1, &model.MessageExternal{ID: 1, Message: "still here"})
+		api.Notify(2, &model.MessageExternal{ID: 2, Message: "hello"})
+	})
+	userOneB.expectMessage(&model.MessageExternal{ID: 1, Message: "still here"})
+	userTwo.expectMessage(&model.MessageExternal{ID: 2, Message: "hello"})
+	userOneA.expectNoMessage()
+}
+
+func TestClientDeletionNotBlockedBySlowClient(t *testing.T) {
+	mode.Set(mode.TestDev)
+	defer leaktest.Check(t)()
+
+	sw := newSlowWriter()
+	defer sw.releaseAndRestore()
+
+	tokens := []string{"slow", "deleteme"}
+	i := 0
+	server, api := bootTestServer(func(ctx *gin.Context) {
+		auth.RegisterClient(ctx, &model.Client{UserID: 1, Token: tokens[i]})
+		i++
+	})
+	defer server.Close()
+	defer api.Close()
+	url := wsURL(server.URL)
+
+	// Slow client of user 1, parked and first in the user's client list.
+	slow := testClient(t, url)
+	defer slow.conn.Close()
+	waitForConnectedClients(api, 1)
+	api.Notify(1, &model.MessageExternal{ID: 0, Message: "prime"})
+	waitFor(t, "slow client to be captured", sw.captured)
+
+	// Another client of the same user that we are going to delete. No read loop,
+	// so messages sent to it during the test cannot leak a reader goroutine.
+	deleteMe := createClient(t, url)
+	defer deleteMe.conn.Close()
+	waitForConnectedClients(api, 2)
+
+	// In the old, broken code this dispatch would block forever holding the read
+	// lock (the slow client's buffer is full), which in turn blocked deletion.
+	go api.Notify(1, &model.MessageExternal{ID: 1, Message: "second"})
+
+	assertReturnsWithin(t, 2*time.Second, "NotifyDeletedClient", func() {
+		api.NotifyDeletedClient(1, "deleteme")
+	})
+
+	for _, c := range clients(api, 1) {
+		assert.NotEqual(t, "deleteme", c.token, "deleted client must be gone")
+	}
+}
+
+func TestExpiredCleanupNotBlockedBySlowClient(t *testing.T) {
+	mode.Set(mode.TestDev)
+	defer leaktest.Check(t)()
+
+	sw := newSlowWriter()
+	defer sw.releaseAndRestore()
+
+	userIDs := []uint{1, 2}
+	tokens := []string{"slow", "healthy"}
+	i := 0
+	server, api := bootTestServer(func(ctx *gin.Context) {
+		auth.RegisterClient(ctx, &model.Client{UserID: userIDs[i], Token: tokens[i]})
+		i++
+	})
+	defer server.Close()
+	defer api.Close()
+	url := wsURL(server.URL)
+
+	// Slow ("expired") client of user 1.
+	slow := testClient(t, url)
+	defer slow.conn.Close()
+	waitForConnectedClients(api, 1)
+	api.Notify(1, &model.MessageExternal{ID: 0, Message: "prime"})
+	waitFor(t, "slow client to be captured", sw.captured)
+
+	// A healthy client of another user that must keep working.
+	healthy := testClient(t, url)
+	defer healthy.conn.Close()
+	waitForConnectedClients(api, 2)
+
+	// A dispatch is in flight to the slow client (old code: stuck holding the lock).
+	go api.Notify(1, &model.MessageExternal{ID: 1, Message: "second"})
+
+	// The cleanup loop disconnects expired clients via NotifyDeletedClient
+	// (see router.go). That must not be blocked by the slow client.
+	assertReturnsWithin(t, 2*time.Second, "expired-client cleanup", func() {
+		api.NotifyDeletedClient(1, "slow")
+	})
+	assert.Empty(t, clients(api, 1))
+
+	// Dispatch to the rest of the system is unaffected.
+	assertReturnsWithin(t, 2*time.Second, "Notify after cleanup", func() {
+		api.Notify(2, &model.MessageExternal{ID: 2, Message: "hello"})
+	})
+	healthy.expectMessage(&model.MessageExternal{ID: 2, Message: "hello"})
 }

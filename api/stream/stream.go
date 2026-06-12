@@ -80,13 +80,21 @@ func (a *API) NotifyDeletedClient(userID uint, token string) {
 }
 
 // Notify notifies the clients with the given userID that a new messages was created.
+//
+// Dispatch never blocks on a single client and never holds the lock while
+// delivering: the target clients are snapshotted under the read lock, the lock is
+// released, and each client is handed the message through its non-blocking buffer
+// (see client.enqueue). A client that cannot keep up is disconnected instead of
+// stalling delivery for everyone else or starving deletion/cleanup of the lock.
 func (a *API) Notify(userID uint, msg *model.MessageExternal) {
 	a.lock.RLock()
-	defer a.lock.RUnlock()
-	if clients, ok := a.clients[userID]; ok {
-		for _, c := range clients {
-			c.write <- msg
-		}
+	clients := a.clients[userID]
+	targets := make([]*client, len(clients))
+	copy(targets, clients)
+	a.lock.RUnlock()
+
+	for _, c := range targets {
+		c.enqueue(msg)
 	}
 }
 
