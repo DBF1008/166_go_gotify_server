@@ -1,0 +1,156 @@
+import axios, {AxiosError, AxiosResponse} from 'axios';
+import * as config from './config';
+import {detect} from 'detect-browser';
+import {SnackReporter} from './snack/SnackManager';
+import {observable, runInAction, action} from 'mobx';
+import {ICurrentUser} from './types';
+
+export class CurrentUser {
+    private reconnectTimeoutId: number | null = null;
+    private reconnectTime = 7500;
+    @observable accessor loggedIn = false;
+    @observable accessor refreshKey = 0;
+    @observable accessor authenticating = true;
+    @observable accessor user: ICurrentUser = {
+        name: 'unknown',
+        admin: false,
+        id: -1,
+        createdAt: '',
+    };
+    @observable accessor connectionErrorMessage: string | null = null;
+
+    public constructor(private readonly snack: SnackReporter) {}
+
+    public register = async (name: string, pass: string): Promise<boolean> =>
+        axios
+            .create()
+            .post(config.get('url') + 'user', {name, pass})
+            .then(() => {
+                this.snack('User Created. Logging in...');
+                this.login(name, pass);
+                return true;
+            })
+            .catch((error: AxiosError<{error?: string; errorDescription?: string}>) => {
+                if (!error || !error.response) {
+                    this.snack('No network connection or server unavailable.');
+                    return false;
+                }
+                const {data} = error.response;
+
+                this.snack(
+                    `Register failed: ${data?.error ?? 'unknown'}: ${data?.errorDescription ?? ''}`
+                );
+                return false;
+            });
+
+    public createClientName = (): string => {
+        const browser = detect();
+        return (browser && browser.name + ' ' + browser.version) || 'unknown browser';
+    };
+
+    public login = async (username: string, password: string) => {
+        runInAction(() => {
+            this.loggedIn = false;
+            this.authenticating = true;
+        });
+        const name = this.createClientName();
+        axios
+            .create()
+            .request({
+                url: config.get('url') + 'auth/local/login',
+                method: 'POST',
+                data: {name},
+                headers: {Authorization: 'Basic ' + btoa(username + ':' + password)},
+            })
+            .then(
+                action((resp: AxiosResponse<ICurrentUser>) => {
+                    this.snack(`A client named '${name}' was created for your session.`);
+                    this.user = resp.data;
+                    this.loggedIn = true;
+                    this.authenticating = false;
+                    this.connectionErrorMessage = null;
+                    this.reconnectTime = 7500;
+                })
+            )
+            .catch(
+                action(() => {
+                    this.authenticating = false;
+                    return this.snack('Login failed');
+                })
+            );
+    };
+
+    public tryAuthenticate = async (): Promise<AxiosResponse<ICurrentUser>> => {
+        return axios
+            .create()
+            .get(config.get('url') + 'current/user')
+            .then(
+                action((passThrough) => {
+                    this.user = passThrough.data;
+                    this.loggedIn = true;
+                    this.authenticating = false;
+                    this.connectionErrorMessage = null;
+                    this.reconnectTime = 7500;
+                    return passThrough;
+                })
+            )
+            .catch(
+                action((error: AxiosError) => {
+                    this.authenticating = false;
+                    if (!error || !error.response) {
+                        this.connectionError('No network connection or server unavailable.');
+                        return Promise.reject(error);
+                    }
+
+                    if (error.response.status >= 500) {
+                        this.connectionError(
+                            `${error.response.statusText} (code: ${error.response.status}).`
+                        );
+                        return Promise.reject(error);
+                    }
+
+                    this.connectionErrorMessage = null;
+
+                    if (error.response.status >= 400 && error.response.status < 500) {
+                        this.logout();
+                    }
+                    return Promise.reject(error);
+                })
+            );
+    };
+
+    public logout = async () => {
+        if (this.loggedIn) {
+            runInAction(() => {
+                this.loggedIn = false;
+            });
+            await axios.post(config.get('url') + 'auth/logout').catch(() => Promise.resolve());
+        }
+    };
+
+    public changePassword = (pass: string) => {
+        axios
+            .post(config.get('url') + 'current/user/password', {pass})
+            .then(() => this.snack('Password changed'));
+    };
+
+    public tryReconnect = (quiet = false) => {
+        this.tryAuthenticate().catch(() => {
+            if (!quiet) {
+                this.snack('Reconnect failed');
+            }
+        });
+    };
+
+    private readonly connectionError = (message: string) => {
+        this.connectionErrorMessage = message;
+        if (this.reconnectTimeoutId !== null) {
+            window.clearTimeout(this.reconnectTimeoutId);
+        }
+        this.reconnectTimeoutId = window.setTimeout(
+            () => this.tryReconnect(true),
+            this.reconnectTime
+        );
+        this.reconnectTime = Math.min(this.reconnectTime * 2, 120000);
+    };
+}
