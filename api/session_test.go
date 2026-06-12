@@ -12,6 +12,7 @@ import (
 	"github.com/gotify/server/v2/auth/password"
 	"github.com/gotify/server/v2/mode"
 	"github.com/gotify/server/v2/model"
+	"github.com/gotify/server/v2/session"
 	"github.com/gotify/server/v2/test"
 	"github.com/gotify/server/v2/test/testdb"
 	"github.com/stretchr/testify/assert"
@@ -38,7 +39,7 @@ func (s *SessionSuite) BeforeTest(suiteName, testName string) {
 	s.ctx, _ = gin.CreateTestContext(s.recorder)
 	withURL(s.ctx, "http", "example.com")
 	s.notified = false
-	s.a = &SessionAPI{DB: s.db, NotifyDeleted: s.notify}
+	s.a = &SessionAPI{DB: s.db, NotifyDeleted: s.notify, SessionService: session.NewService(s.db, func() string { return generateClientToken() })}
 
 	s.db.CreateUser(&model.User{
 		Name: "testuser",
@@ -133,4 +134,40 @@ func (s *SessionSuite) Test_Logout_Success() {
 	assert.True(s.T(), sessionCookie.MaxAge < 0)
 
 	s.db.AssertClientNotExist(1)
+}
+
+func (s *SessionSuite) Test_Login_CreatesClientWithPolicy() {
+	originalGenerateClientToken := generateClientToken
+	defer func() { generateClientToken = originalGenerateClientToken }()
+	generateClientToken = test.Tokens("Cpolicytest1234567a")
+
+	s.ctx.Request = httptest.NewRequest("POST", "/auth/local/login", strings.NewReader("name=policy-test"))
+	s.ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.ctx.Request.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("testuser:testpass")))
+
+	s.a.Login(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	clients, err := s.db.GetClientsByUser(1)
+	assert.NoError(s.T(), err)
+	assert.Len(s.T(), clients, 1)
+	assert.Equal(s.T(), "policy-test", clients[0].Name)
+	// BrowserSessionPolicy: 7 days inactivity timeout
+	assert.Equal(s.T(), uint(7*24*60*60), clients[0].ExpiresAfterInactivitySeconds)
+	// BrowserSessionPolicy: 1 hour initial elevation
+	assert.NotNil(s.T(), clients[0].ElevatedUntil)
+}
+
+func (s *SessionSuite) Test_Login_WrongPassword_NoClientCreated() {
+	s.ctx.Request = httptest.NewRequest("POST", "/auth/local/login", strings.NewReader("name=no-create"))
+	s.ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.ctx.Request.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("testuser:wrongpass")))
+
+	s.a.Login(s.ctx)
+
+	assert.Equal(s.T(), 401, s.recorder.Code)
+	clients, err := s.db.GetClientsByUser(1)
+	assert.NoError(s.T(), err)
+	assert.Len(s.T(), clients, 0)
 }

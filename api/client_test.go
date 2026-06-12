@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gotify/server/v2/mode"
 	"github.com/gotify/server/v2/model"
+	"github.com/gotify/server/v2/session"
 	"github.com/gotify/server/v2/test"
 	"github.com/gotify/server/v2/test/testdb"
 	"github.com/stretchr/testify/assert"
@@ -46,7 +47,7 @@ func (s *ClientSuite) BeforeTest(suiteName, testName string) {
 	s.ctx, _ = gin.CreateTestContext(s.recorder)
 	withURL(s.ctx, "http", "example.com")
 	s.notified = false
-	s.a = &ClientAPI{DB: s.db, NotifyDeleted: s.notify}
+	s.a = &ClientAPI{DB: s.db, NotifyDeleted: s.notify, SessionService: session.NewService(s.db, func() string { return generateClientToken() })}
 }
 
 func (s *ClientSuite) notify(uint, string) {

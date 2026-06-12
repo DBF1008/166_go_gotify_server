@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gotify/server/v2/auth/password"
 	"github.com/gotify/server/v2/model"
+	"github.com/gotify/server/v2/session"
 )
 
 type authState int
@@ -38,8 +39,9 @@ type Database interface {
 
 // Auth is the provider for authentication middleware.
 type Auth struct {
-	DB           Database
-	SecureCookie bool
+	DB             Database
+	SecureCookie   bool
+	SessionService *session.Service
 }
 
 // RequireAdmin requires an elevated client token or basic auth, the user must be an admin.
@@ -160,13 +162,24 @@ func (a *Auth) handleClient(checks ...func(*model.Client) (authState, error)) fu
 		}
 		RegisterClient(ctx, client)
 
-		now := timeNow()
-		if client.LastUsed == nil || client.LastUsed.Add(5*time.Minute).Before(now) {
-			if err := a.DB.UpdateClientTokensLastUsedAndExpiresAt([]string{client.Token}, &now); err != nil {
+		if a.SessionService != nil {
+			updated, err := a.SessionService.Renew(client, 5*time.Minute)
+			if err != nil {
 				return authStateSkip, err
 			}
-			if isCookie {
+			if updated && isCookie {
 				SetCookie(ctx.Writer, client.Token, CookieMaxAge, a.SecureCookie)
+			}
+		} else {
+			// Fallback for backward compatibility (tests that don't set SessionService)
+			now := timeNow()
+			if client.LastUsed == nil || client.LastUsed.Add(5*time.Minute).Before(now) {
+				if err := a.DB.UpdateClientTokensLastUsedAndExpiresAt([]string{client.Token}, &now); err != nil {
+					return authStateSkip, err
+				}
+				if isCookie {
+					SetCookie(ctx.Writer, client.Token, CookieMaxAge, a.SecureCookie)
+				}
 			}
 		}
 
@@ -261,6 +274,13 @@ func (a *Auth) checkClientAdmin(client *model.Client) (authState, error) {
 }
 
 func (a *Auth) checkClientElevated(client *model.Client) (authState, error) {
+	if a.SessionService != nil {
+		if !a.SessionService.IsElevated(client) {
+			return authStateNotElevated, nil
+		}
+		return authStateOk, nil
+	}
+	// Fallback for backward compatibility
 	if client.ElevatedUntil == nil || !timeNow().Before(*client.ElevatedUntil) {
 		return authStateNotElevated, nil
 	}

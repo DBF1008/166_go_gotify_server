@@ -11,6 +11,7 @@ import (
 	"github.com/gotify/server/v2/auth/password"
 	"github.com/gotify/server/v2/mode"
 	"github.com/gotify/server/v2/model"
+	"github.com/gotify/server/v2/session"
 	"github.com/gotify/server/v2/test/testdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
@@ -355,3 +356,99 @@ func (s *AuthenticationSuite) assertHeaderRequest(key, value string, f fMiddlewa
 }
 
 type fMiddleware gin.HandlerFunc
+
+// --- SessionService integration tests ---
+
+func TestSessionServiceAuthSuite(t *testing.T) {
+	suite.Run(t, new(SessionServiceAuthSuite))
+}
+
+type SessionServiceAuthSuite struct {
+	suite.Suite
+	auth *Auth
+	DB   *testdb.Database
+}
+
+func (s *SessionServiceAuthSuite) SetupSuite() {
+	mode.Set(mode.TestDev)
+	s.DB = testdb.NewDB(s.T())
+
+	now := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	timeNow = func() time.Time { return now }
+
+	svc := session.NewService(s.DB.GormDatabase, func() string { return "Cdummy" })
+	svc.SetTimeNow(func() time.Time { return now })
+	s.auth = &Auth{DB: s.DB, SessionService: svc}
+
+	elevated := now.Add(time.Hour)
+
+	s.DB.CreateUser(&model.User{
+		Name: "svcuser",
+		Pass: password.CreatePassword("pw", 5),
+		Clients: []model.Client{
+			{Token: "svc_client", Name: "svc phone"},
+			{Token: "svc_elevated", Name: "svc elevated", ElevatedUntil: &elevated},
+		},
+	})
+}
+
+func (s *SessionServiceAuthSuite) TearDownSuite() {
+	timeNow = time.Now
+	s.DB.Close()
+}
+
+func (s *SessionServiceAuthSuite) TestRequireClient_WithSessionService() {
+	s.assertRequest("token", "svc_client", s.auth.RequireClient, 200)
+	s.assertRequest("token", "svc_elevated", s.auth.RequireClient, 200)
+	s.assertRequest("token", "nonexistent", s.auth.RequireClient, 401)
+}
+
+func (s *SessionServiceAuthSuite) TestRequireElevated_WithSessionService() {
+	s.assertRequest("token", "svc_client", s.auth.RequireElevatedClient, 403)
+	s.assertRequest("token", "svc_elevated", s.auth.RequireElevatedClient, 200)
+}
+
+func (s *SessionServiceAuthSuite) TestCookieRenewal_WithSessionService() {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest("GET", "/", nil)
+	ctx.Request.AddCookie(&http.Cookie{Name: cookieName, Value: "svc_client"})
+
+	s.auth.RequireClient(ctx)
+
+	assert.Equal(s.T(), 200, recorder.Code)
+	// Cookie should be re-set (refreshed) since LastUsed was nil
+	cookies := recorder.Result().Cookies()
+	var refreshed *http.Cookie
+	for _, c := range cookies {
+		if c.Name == CookieName {
+			refreshed = c
+			break
+		}
+	}
+	assert.NotNil(s.T(), refreshed, "cookie should be refreshed on first cookie-based request")
+	assert.Equal(s.T(), "svc_client", refreshed.Value)
+}
+
+func (s *SessionServiceAuthSuite) TestNonCookieRequest_NoCookieRefresh() {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest("GET", "/?token=svc_client", nil)
+
+	s.auth.RequireClient(ctx)
+
+	assert.Equal(s.T(), 200, recorder.Code)
+	// No cookie should be set for query-param based requests
+	cookies := recorder.Result().Cookies()
+	for _, c := range cookies {
+		assert.NotEqual(s.T(), CookieName, c.Name, "cookie should NOT be set for non-cookie requests")
+	}
+}
+
+func (s *SessionServiceAuthSuite) assertRequest(key, value string, f fMiddleware, code int) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest("GET", fmt.Sprintf("/?%s=%s", key, value), nil)
+	f(ctx)
+	assert.Equal(s.T(), code, recorder.Code)
+}

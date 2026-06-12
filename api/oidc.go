@@ -16,13 +16,14 @@ import (
 	"github.com/gotify/server/v2/database"
 	"github.com/gotify/server/v2/decaymap"
 	"github.com/gotify/server/v2/model"
+	"github.com/gotify/server/v2/session"
 	"github.com/rs/zerolog/log"
 	"github.com/zitadel/oidc/v3/pkg/client/rp"
 	httphelper "github.com/zitadel/oidc/v3/pkg/http"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
-func NewOIDC(conf *config.Configuration, db *database.GormDatabase, userChangeNotifier *UserChangeNotifier) *OIDCAPI {
+func NewOIDC(conf *config.Configuration, db *database.GormDatabase, userChangeNotifier *UserChangeNotifier, sessionService *session.Service) *OIDCAPI {
 	scopes := conf.OIDC.Scopes
 	if len(scopes) == 0 {
 		scopes = []string{"openid", "profile", "email"}
@@ -62,6 +63,7 @@ func NewOIDC(conf *config.Configuration, db *database.GormDatabase, userChangeNo
 		SecureCookie:       conf.Server.SecureCookie,
 		AutoRegister:       conf.OIDC.AutoRegister,
 		pendingSessions:    decaymap.NewDecayMap[string, *pendingOIDCSession](time.Now(), pendingSessionMaxAge),
+		SessionService:     sessionService,
 	}
 }
 
@@ -89,6 +91,7 @@ type OIDCAPI struct {
 	SecureCookie       bool
 	AutoRegister       bool
 	pendingSessions    *decaymap.DecayMap[string, *pendingOIDCSession]
+	SessionService     *session.Service
 }
 
 // swagger:operation GET /auth/oidc/login oidc oidcLogin
@@ -206,23 +209,24 @@ func (a *OIDCAPI) CallbackHandler() gin.HandlerFunc {
 			http.Error(w, err.Error(), status)
 			return
 		}
-		session, ok := a.popPendingSession(state)
+		pendingSession, ok := a.popPendingSession(state)
 		if !ok {
 			http.Error(w, "unknown or expired state", http.StatusBadRequest)
 			return
 		}
 
-		if session.Elevate != nil {
-			a.handleElevationCallback(w, session.Elevate, user)
+		if pendingSession.Elevate != nil {
+			a.handleElevationCallback(w, pendingSession.Elevate, user)
 			return
 		}
 
-		client, err := a.createClient(session.ClientName, user.ID)
+		policy := session.BrowserSessionPolicy{}
+		client, err := a.SessionService.Create(user.ID, pendingSession.ClientName, policy, a.tokenExists)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to create client: %v", err), http.StatusInternalServerError)
 			return
 		}
-		auth.SetCookie(w, client.Token, auth.CookieMaxAge, a.SecureCookie)
+		auth.SetCookie(w, client.Token, policy.CookieMaxAge(), a.SecureCookie)
 		// A reverse proxy may have already stripped a url prefix from the URL
 		// without us knowing, we have to make a relative redirect.
 		// We cannot use http.Redirect as this normalizes the Path with r.URL.
@@ -242,8 +246,7 @@ func (a *OIDCAPI) handleElevationCallback(w http.ResponseWriter, elevate *pendin
 		http.Error(w, "client not found", http.StatusNotFound)
 		return
 	}
-	elevatedUntil := time.Now().Add(time.Duration(elevate.DurationSeconds) * time.Second)
-	if err := a.DB.UpdateClientElevatedUntil(client.ID, &elevatedUntil); err != nil {
+	if err := a.SessionService.Elevate(client.ID, time.Duration(elevate.DurationSeconds)*time.Second); err != nil {
 		http.Error(w, fmt.Sprintf("failed to elevate session: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -348,13 +351,13 @@ func (a *OIDCAPI) ExternalTokenHandler(ctx *gin.Context) {
 		ctx.AbortWithError(http.StatusBadRequest, err)
 		return
 	}
-	session, ok := a.popPendingSession(req.State)
+	pendingSession, ok := a.popPendingSession(req.State)
 	if !ok {
 		ctx.AbortWithError(http.StatusBadRequest, errors.New("unknown or expired state"))
 		return
 	}
 	exchangeOpts := []rp.CodeExchangeOpt{
-		rp.CodeExchangeOpt(rp.WithURLParam("redirect_uri", session.RedirectURI)),
+		rp.CodeExchangeOpt(rp.WithURLParam("redirect_uri", pendingSession.RedirectURI)),
 		rp.WithCodeVerifier(req.CodeVerifier),
 	}
 	tokens, err := rp.CodeExchange[*oidc.IDTokenClaims](ctx.Request.Context(), req.Code, a.Provider, exchangeOpts...)
@@ -372,7 +375,7 @@ func (a *OIDCAPI) ExternalTokenHandler(ctx *gin.Context) {
 		ctx.AbortWithError(status, resolveErr)
 		return
 	}
-	client, err := a.createClient(session.ClientName, user.ID)
+	client, err := a.SessionService.Create(user.ID, pendingSession.ClientName, session.NativeSessionPolicy{}, a.tokenExists)
 	if err != nil {
 		ctx.AbortWithError(http.StatusInternalServerError, err)
 		return
@@ -421,22 +424,15 @@ func (a *OIDCAPI) resolveUser(info *oidc.UserInfo) (*model.User, int, error) {
 	return user, 0, nil
 }
 
-func (a *OIDCAPI) createClient(name string, userID uint) (*model.Client, error) {
-	elevatedUntil := time.Now().Add(model.DefaultElevationDuration)
-	client := &model.Client{
-		Name:                          name,
-		Token:                         auth.GenerateNotExistingToken(generateClientToken, func(t string) bool { c, _ := a.DB.GetClientByToken(t); return c != nil }),
-		UserID:                        userID,
-		ElevatedUntil:                 &elevatedUntil,
-		ExpiresAfterInactivitySeconds: auth.CookieMaxAge,
-	}
-	return client, a.DB.CreateClient(client)
+func (a *OIDCAPI) tokenExists(token string) bool {
+	c, _ := a.DB.GetClientByToken(token)
+	return c != nil
 }
 
 func (a *OIDCAPI) popPendingSession(key string) (*pendingOIDCSession, bool) {
-	session, ok := a.pendingSessions.Pop(key)
-	if ok && time.Since(session.CreatedAt) < pendingSessionMaxAge {
-		return session, true
+	pending, ok := a.pendingSessions.Pop(key)
+	if ok && time.Since(pending.CreatedAt) < pendingSessionMaxAge {
+		return pending, true
 	}
 	return nil, false
 }

@@ -2,27 +2,26 @@ package api
 
 import (
 	"errors"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gotify/server/v2/auth"
 	"github.com/gotify/server/v2/auth/password"
 	"github.com/gotify/server/v2/model"
+	"github.com/gotify/server/v2/session"
 )
 
 // SessionDatabase is the interface for session-related database access.
 type SessionDatabase interface {
 	GetUserByName(name string) (*model.User, error)
-	CreateClient(client *model.Client) error
 	GetClientByToken(token string) (*model.Client, error)
-	DeleteClientByID(id uint) error
 }
 
 // SessionAPI provides handlers for cookie-based session authentication.
 type SessionAPI struct {
-	DB            SessionDatabase
-	NotifyDeleted func(uint, string)
-	SecureCookie  bool
+	DB             SessionDatabase
+	NotifyDeleted  func(uint, string)
+	SecureCookie   bool
+	SessionService *session.Service
 }
 
 // swagger:operation POST /auth/local/login auth localLogin
@@ -75,19 +74,14 @@ func (a *SessionAPI) Login(ctx *gin.Context) {
 		return
 	}
 
-	elevatedUntil := time.Now().Add(model.DefaultElevationDuration)
-	client := model.Client{
-		Name:                          clientParams.Name,
-		Token:                         auth.GenerateNotExistingToken(generateClientToken, a.clientExists),
-		UserID:                        user.ID,
-		ElevatedUntil:                 &elevatedUntil,
-		ExpiresAfterInactivitySeconds: auth.CookieMaxAge,
-	}
-	if success := successOrAbort(ctx, 500, a.DB.CreateClient(&client)); !success {
+	policy := session.BrowserSessionPolicy{}
+	client, err := a.SessionService.Create(user.ID, clientParams.Name, policy, a.clientExists)
+	if err != nil {
+		ctx.AbortWithError(500, err)
 		return
 	}
 
-	auth.SetCookie(ctx.Writer, client.Token, auth.CookieMaxAge, a.SecureCookie)
+	auth.SetCookie(ctx.Writer, client.Token, policy.CookieMaxAge(), a.SecureCookie)
 
 	ctx.JSON(200, &model.CurrentUserExternal{
 		ID:            user.ID,
@@ -132,7 +126,8 @@ func (a *SessionAPI) Logout(ctx *gin.Context) {
 	}
 
 	a.NotifyDeleted(client.UserID, client.Token)
-	if success := successOrAbort(ctx, 500, a.DB.DeleteClientByID(client.ID)); !success {
+	if err := a.SessionService.Logout(client.ID); err != nil {
+		ctx.AbortWithError(500, err)
 		return
 	}
 

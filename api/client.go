@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gotify/server/v2/auth"
 	"github.com/gotify/server/v2/model"
+	"github.com/gotify/server/v2/session"
 )
 
 // The ClientDatabase interface for encapsulating database access.
@@ -23,9 +24,10 @@ type ClientDatabase interface {
 
 // The ClientAPI provides handlers for managing clients and applications.
 type ClientAPI struct {
-	DB            ClientDatabase
-	ImageDir      string
-	NotifyDeleted func(uint, string)
+	DB             ClientDatabase
+	ImageDir       string
+	NotifyDeleted  func(uint, string)
+	SessionService *session.Service
 }
 
 // Client Params Model
@@ -150,16 +152,12 @@ func (a *ClientAPI) UpdateClient(ctx *gin.Context) {
 func (a *ClientAPI) CreateClient(ctx *gin.Context) {
 	clientParams := ClientParams{}
 	if err := ctx.Bind(&clientParams); err == nil {
-		client := model.Client{
-			Name:   clientParams.Name,
-			Token:  auth.GenerateNotExistingToken(generateClientToken, a.clientExists),
-			UserID: auth.GetUserID(ctx),
+		policy := session.PersistentClientPolicy{
+			CustomExpiry: clientParams.ExpiresAfterInactivitySeconds,
 		}
-		if clientParams.ExpiresAfterInactivitySeconds != nil {
-			client.ExpiresAfterInactivitySeconds = *clientParams.ExpiresAfterInactivitySeconds
-		}
-
-		if success := successOrAbort(ctx, 500, a.DB.CreateClient(&client)); !success {
+		client, err := a.SessionService.Create(auth.GetUserID(ctx), clientParams.Name, policy, a.clientExists)
+		if err != nil {
+			ctx.AbortWithError(500, err)
 			return
 		}
 		ctx.JSON(200, client)
@@ -312,8 +310,7 @@ func (a *ClientAPI) ElevateClient(ctx *gin.Context) {
 			return
 		}
 
-		elevatedUntil := time.Now().Add(time.Duration(params.DurationSeconds) * time.Second)
-		if err := a.DB.UpdateClientElevatedUntil(client.ID, &elevatedUntil); err != nil {
+		if err := a.SessionService.Elevate(client.ID, time.Duration(params.DurationSeconds)*time.Second); err != nil {
 			ctx.AbortWithError(500, err)
 			return
 		}

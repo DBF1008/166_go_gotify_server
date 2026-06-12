@@ -10,6 +10,7 @@ import (
 	"github.com/gotify/server/v2/auth"
 	"github.com/gotify/server/v2/decaymap"
 	"github.com/gotify/server/v2/mode"
+	"github.com/gotify/server/v2/session"
 	"github.com/gotify/server/v2/test"
 	"github.com/gotify/server/v2/test/testdb"
 	"github.com/stretchr/testify/assert"
@@ -49,6 +50,7 @@ func (s *OIDCSuite) BeforeTest(suiteName, testName string) {
 		UsernameClaim:      "preferred_username",
 		AutoRegister:       true,
 		pendingSessions:    decaymap.NewDecayMap[string, *pendingOIDCSession](time.Now(), pendingSessionMaxAge),
+		SessionService:     session.NewService(s.db.GormDatabase, func() string { return generateClientToken() }),
 	}
 }
 
@@ -148,7 +150,7 @@ func (s *OIDCSuite) Test_CreateClient() {
 	defer func() { generateClientToken = origGenClientToken }()
 
 	s.db.NewUser(1)
-	client, err := s.a.createClient("MyPhone", 1)
+	client, err := s.a.SessionService.Create(1, "MyPhone", session.BrowserSessionPolicy{}, s.a.tokenExists)
 
 	assert.NoError(s.T(), err)
 	assert.Equal(s.T(), "MyPhone", client.Name)

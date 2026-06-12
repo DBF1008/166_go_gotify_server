@@ -20,6 +20,7 @@ import (
 	gerror "github.com/gotify/server/v2/error"
 	"github.com/gotify/server/v2/model"
 	"github.com/gotify/server/v2/plugin"
+	"github.com/gotify/server/v2/session"
 	"github.com/gotify/server/v2/ui"
 	"github.com/rs/zerolog/log"
 )
@@ -67,15 +68,16 @@ func Create(db *database.GormDatabase, vInfo *model.VersionInfo, conf *config.Co
 	}
 	streamHandler := stream.New(
 		time.Duration(conf.Server.Stream.PingPeriodSeconds)*time.Second, 15*time.Second, conf.Server.Stream.AllowedOrigins)
+	sessionService := session.NewService(db, auth.GenerateClientToken)
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		for range ticker.C {
 			connectedTokens := streamHandler.CollectConnectedClientTokens()
-			now := time.Now()
-			if err := db.UpdateClientTokensLastUsedAndExpiresAt(connectedTokens, &now); err != nil {
+			if err := sessionService.RenewTokens(connectedTokens); err != nil {
 				log.Error().Err(err).Msg("Error updating last used")
 			}
-			if expired, err := db.CleanupExpiredClients(now); err == nil {
+			now := time.Now()
+			if expired, err := sessionService.CleanupExpired(now); err == nil {
 				for _, c := range expired {
 					streamHandler.NotifyDeletedClient(c.UserID, c.Token)
 				}
@@ -84,19 +86,20 @@ func Create(db *database.GormDatabase, vInfo *model.VersionInfo, conf *config.Co
 			}
 		}
 	}()
-	authentication := auth.Auth{DB: db, SecureCookie: conf.Server.SecureCookie}
+	authentication := auth.Auth{DB: db, SecureCookie: conf.Server.SecureCookie, SessionService: sessionService}
 	messageHandler := api.MessageAPI{Notifier: streamHandler, DB: db}
 	healthHandler := api.HealthAPI{DB: db}
 	clientHandler := api.ClientAPI{
-		DB:            db,
-		ImageDir:      conf.UploadedImagesDir,
-		NotifyDeleted: streamHandler.NotifyDeletedClient,
+		DB:             db,
+		ImageDir:       conf.UploadedImagesDir,
+		NotifyDeleted:  streamHandler.NotifyDeletedClient,
+		SessionService: sessionService,
 	}
 	applicationHandler := api.ApplicationAPI{
 		DB:       db,
 		ImageDir: conf.UploadedImagesDir,
 	}
-	sessionHandler := api.SessionAPI{DB: db, NotifyDeleted: streamHandler.NotifyDeletedClient, SecureCookie: conf.Server.SecureCookie}
+	sessionHandler := api.SessionAPI{DB: db, NotifyDeleted: streamHandler.NotifyDeletedClient, SecureCookie: conf.Server.SecureCookie, SessionService: sessionService}
 	userChangeNotifier := new(api.UserChangeNotifier)
 	userHandler := api.UserAPI{DB: db, PasswordStrength: conf.PassStrength, UserChangeNotifier: userChangeNotifier, Registration: conf.Registration}
 
@@ -117,7 +120,7 @@ func Create(db *database.GormDatabase, vInfo *model.VersionInfo, conf *config.Co
 	ui.Register(g, *vInfo, conf.Registration, conf.OIDC.Enabled)
 
 	if conf.OIDC.Enabled {
-		oidcHandler := api.NewOIDC(conf, db, userChangeNotifier)
+		oidcHandler := api.NewOIDC(conf, db, userChangeNotifier, sessionService)
 		oidcGroup := g.Group("/auth/oidc")
 		oidcGroup.GET("/login", oidcHandler.LoginHandler())
 		oidcGroup.GET("/callback", oidcHandler.CallbackHandler())

@@ -13,4 +13,6 @@ type ElevateRequest struct {
 	DurationSeconds int `form:"durationSeconds" query:"durationSeconds" json:"durationSeconds" binding:"required"`
 }
 
+// DefaultElevationDuration is the initial elevation duration for new sessions.
+// Referenced by session.BrowserSessionPolicy and session.NativeSessionPolicy.
 var DefaultElevationDuration = time.Hour

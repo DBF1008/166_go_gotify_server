@@ -53,6 +53,9 @@ type Client struct {
 	ExpiresAt *time.Time `gorm:"index" json:"expiresAt,omitempty"`
 }
 
+// PopulateExpiresAt recalculates ExpiresAt based on CreatedAt/LastUsed and
+// ExpiresAfterInactivitySeconds. This is called by the database layer on create/update.
+// For lifecycle management, prefer using session.Service which applies policies.
 func (c *Client) PopulateExpiresAt() {
 	c.ExpiresAt = c.calculateExpiresAt()
 }
