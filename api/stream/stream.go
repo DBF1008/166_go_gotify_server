@@ -1,9 +1,11 @@
 package stream
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,14 @@ import (
 	"github.com/gotify/server/v2/model"
 )
 
+// MessageHistory provides the messages a client missed while it was disconnected, so they can be
+// replayed when the client reconnects with a resume cursor.
+type MessageHistory interface {
+	// GetMessagesAfter returns up to limit messages for the user with an id greater than 'after',
+	// ordered ascending (oldest first).
+	GetMessagesAfter(userID, after uint, limit int) ([]*model.MessageExternal, error)
+}
+
 // The API provides a handler for a WebSocket stream API.
 type API struct {
 	clients     map[uint][]*client
@@ -22,18 +32,22 @@ type API struct {
 	pingPeriod  time.Duration
 	pongTimeout time.Duration
 	upgrader    *websocket.Upgrader
+	history     MessageHistory
 }
 
 // New creates a new instance of API.
 // pingPeriod: is the interval, in which is server sends the a ping to the client.
 // pongTimeout: is the duration after the connection will be terminated, when the client does not respond with the
 // pong command.
-func New(pingPeriod, pongTimeout time.Duration, allowedWebSocketOrigins []string) *API {
+// history: provides missed messages for clients that reconnect with a resume cursor. It may be nil,
+// in which case clients always start from the live stream without replay.
+func New(pingPeriod, pongTimeout time.Duration, allowedWebSocketOrigins []string, history MessageHistory) *API {
 	return &API{
 		clients:     make(map[uint][]*client),
 		pingPeriod:  pingPeriod,
 		pongTimeout: pingPeriod + pongTimeout,
 		upgrader:    newUpgrader(allowedWebSocketOrigins),
+		history:     history,
 	}
 }
 
@@ -118,6 +132,14 @@ func (a *API) register(client *client) {
 //	---
 //	schema: ws, wss
 //	produces: [application/json]
+//	parameters:
+//	- name: since
+//	  in: query
+//	  description: replay all messages created after this message id, then continue with the live stream. Pass the id of the last message the client already processed. Omit it (or use 0) on first connection to start from the live stream without replay.
+//	  minimum: 0
+//	  required: false
+//	  type: integer
+//	  format: int64
 //	security: [clientTokenAuthorizationHeader: [], clientTokenHeader: [], clientTokenQuery: [], basicAuth: []]
 //	responses:
 //	  200:
@@ -141,6 +163,12 @@ func (a *API) register(client *client) {
 //	    schema:
 //	        $ref: "#/definitions/Error"
 func (a *API) Handle(ctx *gin.Context) {
+	since, err := parseSince(ctx)
+	if err != nil {
+		ctx.AbortWithError(http.StatusBadRequest, err)
+		return
+	}
+
 	conn, err := a.upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
 		ctx.Error(err)
@@ -151,10 +179,26 @@ func (a *API) Handle(ctx *gin.Context) {
 	if c := auth.GetClient(ctx); c != nil {
 		token = c.Token
 	}
-	client := newClient(conn, auth.GetUserID(ctx), token, a.remove)
+	client := newClient(conn, auth.GetUserID(ctx), token, since, a.history, a.remove)
 	a.register(client)
 	go client.startReading(a.pongTimeout)
 	go client.startWriteHandler(a.pingPeriod)
+}
+
+// parseSince reads the optional `since` resume cursor from the request query. It is the id of the
+// last message the client already processed; the stream replays every message created after it.
+// An empty value means "no cursor" (first connection). A malformed value yields an error so the
+// caller can reject the request with a clear status before upgrading the connection.
+func parseSince(ctx *gin.Context) (uint, error) {
+	raw := strings.TrimSpace(ctx.Query("since"))
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid since cursor %q: must be a non-negative integer", raw)
+	}
+	return uint(value), nil
 }
 
 // Close closes all client connections and stops answering new connections.

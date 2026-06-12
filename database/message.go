@@ -50,6 +50,21 @@ func (d *GormDatabase) GetMessagesByUserSince(userID uint, limit int, since uint
 	return messages, err
 }
 
+// GetMessagesByUserAfter returns limited messages from a user with an id greater than 'after',
+// ordered ascending (oldest first). It is used to replay messages a client missed while it was
+// disconnected, so they arrive in the same chronological order as the live stream.
+func (d *GormDatabase) GetMessagesByUserAfter(userID uint, limit int, after uint) ([]*model.Message, error) {
+	var messages []*model.Message
+	err := d.DB.Joins("JOIN applications ON applications.user_id = ?", userID).
+		Where("messages.application_id = applications.id").
+		Where("messages.id > ?", after).
+		Order("messages.id asc").Limit(limit).Find(&messages).Error
+	if err == gorm.ErrRecordNotFound {
+		err = nil
+	}
+	return messages, err
+}
+
 // GetMessagesByApplication returns all messages from an application.
 func (d *GormDatabase) GetMessagesByApplication(tokenID uint) ([]*model.Message, error) {
 	var messages []*model.Message

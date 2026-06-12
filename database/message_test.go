@@ -223,6 +223,70 @@ func (s *DatabaseSuite) TestGetMessagesSince() {
 	hasIDInclusiveBetween(s.T(), actual, 100, 2, 2)
 }
 
+func (s *DatabaseSuite) TestGetMessagesByUserAfter() {
+	user := &model.User{Name: "test", Pass: []byte{1}}
+	require.NoError(s.T(), s.db.CreateUser(user))
+
+	app := &model.Application{UserID: user.ID, Token: "A0000000000"}
+	app2 := &model.Application{UserID: user.ID, Token: "A0000000001"}
+	require.NoError(s.T(), s.db.CreateApplication(app))
+	require.NoError(s.T(), s.db.CreateApplication(app2))
+
+	curDate := time.Now()
+	for i := 1; i <= 500; i++ {
+		s.db.CreateMessage(&model.Message{ApplicationID: app.ID, Message: "abc", Date: curDate.Add(time.Duration(i) * time.Second)})
+		s.db.CreateMessage(&model.Message{ApplicationID: app2.ID, Message: "abc", Date: curDate.Add(time.Duration(i) * time.Second)})
+	}
+	// ids 1..1000 are assigned in insertion order, so odd ids belong to app and even ids to app2.
+
+	// after=0 returns the oldest messages first, limited.
+	actual, err := s.db.GetMessagesByUserAfter(user.ID, 50, 0)
+	require.NoError(s.T(), err)
+	assert.Len(s.T(), actual, 50)
+	hasIDInclusiveBetweenAsc(s.T(), actual, 1, 50)
+
+	// after=50 starts right after the cursor (exclusive).
+	actual, err = s.db.GetMessagesByUserAfter(user.ID, 50, 50)
+	require.NoError(s.T(), err)
+	assert.Len(s.T(), actual, 50)
+	hasIDInclusiveBetweenAsc(s.T(), actual, 51, 100)
+
+	// A limit larger than the remaining messages returns only what is left.
+	actual, err = s.db.GetMessagesByUserAfter(user.ID, 100, 950)
+	require.NoError(s.T(), err)
+	assert.Len(s.T(), actual, 50)
+	hasIDInclusiveBetweenAsc(s.T(), actual, 951, 1000)
+
+	// A cursor at or beyond the newest message id replays nothing.
+	actual, err = s.db.GetMessagesByUserAfter(user.ID, 100, 1000)
+	require.NoError(s.T(), err)
+	assert.Empty(s.T(), actual)
+
+	actual, err = s.db.GetMessagesByUserAfter(user.ID, 100, 5000)
+	require.NoError(s.T(), err)
+	assert.Empty(s.T(), actual)
+
+	// Messages from both applications come back interleaved by id (mixed apps, chronological).
+	actual, err = s.db.GetMessagesByUserAfter(user.ID, 4, 0)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), actual, 4)
+	assert.Equal(s.T(), app.ID, actual[0].ApplicationID)  // id 1
+	assert.Equal(s.T(), app2.ID, actual[1].ApplicationID) // id 2
+	assert.Equal(s.T(), app.ID, actual[2].ApplicationID)  // id 3
+	assert.Equal(s.T(), app2.ID, actual[3].ApplicationID) // id 4
+}
+
+func hasIDInclusiveBetweenAsc(t *testing.T, msgs []*model.Message, from, to int) {
+	index := 0
+	for expectedID := from; expectedID <= to; expectedID++ {
+		if !assert.Equal(t, uint(expectedID), msgs[index].ID) {
+			break
+		}
+		index++
+	}
+	assert.Equal(t, index, len(msgs), "not all entries inside msgs were checked")
+}
+
 func hasIDInclusiveBetween(t *testing.T, msgs []*model.Message, from, to, decrement int) {
 	index := 0
 	for expectedID := from; expectedID >= to; expectedID -= decrement {

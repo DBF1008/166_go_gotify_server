@@ -10,6 +10,10 @@ import (
 
 const (
 	writeWait = 2 * time.Second
+
+	// replayBatchSize bounds how many missed messages are loaded from the history per query, so a
+	// large backlog is streamed in chunks instead of being held in memory all at once.
+	replayBatchSize = 100
 )
 
 var ping = func(conn *websocket.Conn) error {
@@ -26,16 +30,26 @@ type client struct {
 	write   chan *model.MessageExternal
 	userID  uint
 	token   string
-	once    once
+	// since is the resume cursor: the id of the last message the client already processed. Zero
+	// means "first connection" (no replay).
+	since uint
+	// lastSentID tracks the highest message id delivered to the client so duplicates can be
+	// skipped while transitioning from the replay to the live stream. Only used when resuming.
+	lastSentID uint
+	history    MessageHistory
+	once       once
 }
 
-func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*client)) *client {
+func newClient(conn *websocket.Conn, userID uint, token string, since uint, history MessageHistory, onClose func(*client)) *client {
 	return &client{
-		conn:    conn,
-		write:   make(chan *model.MessageExternal, 1),
-		userID:  userID,
-		token:   token,
-		onClose: onClose,
+		conn:       conn,
+		write:      make(chan *model.MessageExternal, 1),
+		userID:     userID,
+		token:      token,
+		since:      since,
+		lastSentID: since,
+		history:    history,
+		onClose:    onClose,
 	}
 }
 
@@ -75,6 +89,7 @@ func (c *client) startReading(pongWait time.Duration) {
 }
 
 // startWriteHandler starts the write loop. The method has the following tasks:
+// * replay messages the client missed while disconnected (when a resume cursor was provided)
 // * ping the client in the interval provided as parameter
 // * write messages send by the channel to the client
 // * on errors exit the loop.
@@ -85,6 +100,13 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 		pingTicker.Stop()
 	}()
 
+	// Replay everything the client missed before switching to the live stream. The client was
+	// already registered, so any message produced during the replay is buffered on the write
+	// channel and de-duplicated below by its id.
+	if !c.replayMissedMessages() {
+		return
+	}
+
 	for {
 		select {
 		case message, ok := <-c.write:
@@ -92,10 +114,18 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 				return
 			}
 
+			if c.since > 0 && message.ID != 0 && message.ID <= c.lastSentID {
+				// Already delivered during the replay; skip the duplicate.
+				continue
+			}
+
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := writeJSON(c.conn, message); err != nil {
 				printWebSocketError("WriteError", err)
 				return
+			}
+			if c.since > 0 {
+				c.lastSentID = message.ID
 			}
 		case <-pingTicker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
@@ -103,6 +133,37 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 				printWebSocketError("PingError", err)
 				return
 			}
+		}
+	}
+}
+
+// replayMissedMessages streams every message created after the resume cursor, in chronological
+// order, before the live stream begins. It returns false if writing to the connection failed and
+// the write loop should stop. A nil history or a zero cursor (first connection) replays nothing.
+func (c *client) replayMissedMessages() bool {
+	if c.history == nil || c.since == 0 {
+		return true
+	}
+	cursor := c.since
+	for {
+		msgs, err := c.history.GetMessagesAfter(c.userID, cursor, replayBatchSize)
+		if err != nil {
+			// Keep the live subscription instead of dropping the connection on a transient history
+			// error; the client still receives newly created messages.
+			log.Warn().Err(err).Msg("WebSocket ReplayError")
+			return true
+		}
+		for _, msg := range msgs {
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := writeJSON(c.conn, msg); err != nil {
+				printWebSocketError("WriteError", err)
+				return false
+			}
+			c.lastSentID = msg.ID
+			cursor = msg.ID
+		}
+		if len(msgs) < replayBatchSize {
+			return true
 		}
 	}
 }

@@ -66,7 +66,8 @@ func Create(db *database.GormDatabase, vInfo *model.VersionInfo, conf *config.Co
 		})
 	}
 	streamHandler := stream.New(
-		time.Duration(conf.Server.Stream.PingPeriodSeconds)*time.Second, 15*time.Second, conf.Server.Stream.AllowedOrigins)
+		time.Duration(conf.Server.Stream.PingPeriodSeconds)*time.Second, 15*time.Second, conf.Server.Stream.AllowedOrigins,
+		&api.StreamMessageHistory{DB: db})
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		for range ticker.C {
