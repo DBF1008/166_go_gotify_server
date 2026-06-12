@@ -272,6 +272,8 @@ func (s *ApplicationSuite) Test_GetApplications_WithImage() {
 	second := userBuilder.NewAppWithToken(2, "asdasd")
 	first.Image = "abcd.jpg"
 	s.db.UpdateApplication(first)
+	fakeImage(s.T(), "abcd.jpg")
+	defer os.Remove("abcd.jpg")
 
 	test.WithUser(s.ctx, 5)
 	s.ctx.Request = httptest.NewRequest("GET", "/tokens", nil)
@@ -710,4 +712,204 @@ func fakeImage(t *testing.T, path string) {
 	// Write data to dst
 	err = os.WriteFile(path, data, 0o644)
 	assert.Nil(t, err)
+}
+
+// failingUpdateDB wraps an ApplicationDatabase and always returns an error on UpdateApplication.
+type failingUpdateDB struct {
+	ApplicationDatabase
+	err error
+}
+
+func (f *failingUpdateDB) UpdateApplication(_ *model.Application) error {
+	return f.err
+}
+
+// failingDeleteDB wraps an ApplicationDatabase and always returns an error on DeleteApplicationByID.
+type failingDeleteDB struct {
+	ApplicationDatabase
+	err error
+}
+
+func (f *failingDeleteDB) DeleteApplicationByID(_ uint) error {
+	return f.err
+}
+
+// Regression: when DB update fails during image upload, the newly saved file is cleaned up
+// and the old image file + DB record are preserved unchanged.
+func (s *ApplicationSuite) Test_UploadAppImage_DBUpdateFails_RollsBackNewFile() {
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: "old.png"})
+	fakeImage(s.T(), "old.png")
+	defer os.Remove("old.png")
+
+	dbErr := errors.New("db update failed")
+	s.a.DB = &failingUpdateDB{ApplicationDatabase: s.db, err: dbErr}
+
+	cType, buffer, err := upload(map[string]*os.File{"file": mustOpen("../test/assets/image.png")})
+	require.Nil(s.T(), err)
+	s.ctx.Request = httptest.NewRequest("POST", "/irrelevant", &buffer)
+	s.ctx.Request.Header.Set("Content-Type", cType)
+	test.WithUser(s.ctx, 5)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.UploadApplicationImage(s.ctx)
+
+	// Should return 500
+	assert.Equal(s.T(), 500, s.recorder.Code)
+
+	// The newly saved file (firstGeneratedImageName) should have been cleaned up
+	newFile := firstApplicationToken[1:] + ".png"
+	_, statErr := os.Stat(newFile)
+	assert.True(s.T(), os.IsNotExist(statErr), "new file should be removed on DB failure")
+
+	// The old file should still exist
+	_, statErr = os.Stat("old.png")
+	assert.Nil(s.T(), statErr, "old file should be preserved")
+
+	// The DB record should still reference the old image
+	app, dbErr := s.db.GetApplicationByID(1)
+	require.NoError(s.T(), dbErr)
+	assert.Equal(s.T(), "old.png", app.Image)
+}
+
+// Regression: when file save fails, no DB changes and no old file deletion.
+func (s *ApplicationSuite) Test_UploadAppImage_FileSaveFails_NoChanges() {
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: "old.png"})
+	fakeImage(s.T(), "old.png")
+	defer os.Remove("old.png")
+
+	// Point ImageDir to a non-existent directory so SaveUploadedFile fails.
+	s.a.ImageDir = "/nonexistent_dir_that_should_not_exist/"
+
+	cType, buffer, err := upload(map[string]*os.File{"file": mustOpen("../test/assets/image.png")})
+	require.Nil(s.T(), err)
+	s.ctx.Request = httptest.NewRequest("POST", "/irrelevant", &buffer)
+	s.ctx.Request.Header.Set("Content-Type", cType)
+	test.WithUser(s.ctx, 5)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.UploadApplicationImage(s.ctx)
+
+	assert.Equal(s.T(), 500, s.recorder.Code)
+
+	// The old file should still exist
+	_, statErr := os.Stat("old.png")
+	assert.Nil(s.T(), statErr, "old file should be preserved when save fails")
+
+	// The DB record should still reference the old image
+	app, dbErr := s.db.GetApplicationByID(1)
+	require.NoError(s.T(), dbErr)
+	assert.Equal(s.T(), "old.png", app.Image)
+
+	// Reset ImageDir for cleanup
+	s.a.ImageDir = ""
+}
+
+// Regression: successful replacement — old file deleted, new file exists, DB updated.
+func (s *ApplicationSuite) Test_UploadAppImage_ReplaceExisting_ConsistentState() {
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: "old.png"})
+	fakeImage(s.T(), "old.png")
+
+	cType, buffer, err := upload(map[string]*os.File{"file": mustOpen("../test/assets/image.png")})
+	require.Nil(s.T(), err)
+	s.ctx.Request = httptest.NewRequest("POST", "/irrelevant", &buffer)
+	s.ctx.Request.Header.Set("Content-Type", cType)
+	test.WithUser(s.ctx, 5)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.UploadApplicationImage(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	// Old file should be deleted
+	_, statErr := os.Stat("old.png")
+	assert.True(s.T(), os.IsNotExist(statErr), "old file should be deleted after successful replace")
+
+	// New file should exist
+	newFile := firstApplicationToken[1:] + ".png"
+	_, statErr = os.Stat(newFile)
+	assert.Nil(s.T(), statErr, "new file should exist")
+	defer os.Remove(newFile)
+
+	// DB should reference the new file
+	app, dbErr := s.db.GetApplicationByID(1)
+	require.NoError(s.T(), dbErr)
+	assert.Equal(s.T(), newFile, app.Image)
+
+	// JSON response should use the resolved path
+	assert.Contains(s.T(), s.recorder.Body.String(), "image/"+newFile)
+}
+
+// Regression: when DB update fails during image removal, the file is preserved and DB is unchanged.
+func (s *ApplicationSuite) Test_RemoveAppImage_DBUpdateFails_PreservesFile() {
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: "keep.png"})
+	fakeImage(s.T(), "keep.png")
+	defer os.Remove("keep.png")
+
+	dbErr := errors.New("db update failed")
+	s.a.DB = &failingUpdateDB{ApplicationDatabase: s.db, err: dbErr}
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("DELETE", "/irrelevant", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RemoveApplicationImage(s.ctx)
+
+	assert.Equal(s.T(), 500, s.recorder.Code)
+
+	// The file should still exist
+	_, statErr := os.Stat("keep.png")
+	assert.Nil(s.T(), statErr, "file should be preserved when DB update fails")
+
+	// DB record should still reference the image
+	app, err := s.db.GetApplicationByID(1)
+	require.NoError(s.T(), err)
+	assert.Equal(s.T(), "keep.png", app.Image)
+}
+
+// Regression: when DB delete fails, the application and its image file are preserved.
+func (s *ApplicationSuite) Test_DeleteApplication_DBDeleteFails_PreservesFile() {
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: "keep.png"})
+	fakeImage(s.T(), "keep.png")
+	defer os.Remove("keep.png")
+
+	dbErr := errors.New("db delete failed")
+	s.a.DB = &failingDeleteDB{ApplicationDatabase: s.db, err: dbErr}
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("DELETE", "/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.DeleteApplication(s.ctx)
+
+	assert.Equal(s.T(), 500, s.recorder.Code)
+
+	// The file should still exist
+	_, statErr := os.Stat("keep.png")
+	assert.Nil(s.T(), statErr, "file should be preserved when DB delete fails")
+
+	// The app should still exist in DB
+	s.db.AssertAppExist(1)
+}
+
+// Regression: resolveImage falls back to default icon when the image file is missing from disk.
+func (s *ApplicationSuite) Test_ResolveImage_FallbackWhenFileMissing() {
+	userBuilder := s.db.User(5)
+	app := userBuilder.NewAppWithToken(1, "perfper")
+	app.Image = "ghost.png" // file does not exist on disk
+	s.db.UpdateApplication(app)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("GET", "/tokens", nil)
+
+	s.a.GetApplications(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	// Should fall back to default icon since "ghost.png" doesn't exist on disk.
+	app.Image = "static/defaultapp.png"
+	test.BodyEquals(s.T(), []*model.Application{app}, s.recorder)
 }

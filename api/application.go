@@ -106,7 +106,7 @@ func (a *ApplicationAPI) CreateApplication(ctx *gin.Context) {
 			handleApplicationError(ctx, err)
 			return
 		}
-		ctx.JSON(200, withResolvedImage(&app))
+		ctx.JSON(200, a.resolveImage(&app))
 	}
 }
 
@@ -141,7 +141,7 @@ func (a *ApplicationAPI) GetApplications(ctx *gin.Context) {
 		return
 	}
 	for _, app := range apps {
-		withResolvedImage(app)
+		a.resolveImage(app)
 	}
 	ctx.JSON(200, apps)
 }
@@ -269,7 +269,7 @@ func (a *ApplicationAPI) UpdateApplication(ctx *gin.Context) {
 					handleApplicationError(ctx, err)
 					return
 				}
-				ctx.JSON(200, withResolvedImage(app))
+				ctx.JSON(200, a.resolveImage(app))
 			}
 		} else {
 			ctx.AbortWithError(404, fmt.Errorf("app with id %d doesn't exists", id))
@@ -363,15 +363,20 @@ func (a *ApplicationAPI) UploadApplicationImage(ctx *gin.Context) {
 				return
 			}
 
-			if app.Image != "" {
-				os.Remove(a.ImageDir + app.Image)
-			}
-
+			oldImage := app.Image
 			app.Image = name
-			if success := successOrAbort(ctx, 500, a.DB.UpdateApplication(app)); !success {
+			if err := a.DB.UpdateApplication(app); err != nil {
+				// Rollback: remove the newly saved file and restore in-memory state.
+				os.Remove(a.ImageDir + name)
+				app.Image = oldImage
+				handleApplicationError(ctx, err)
 				return
 			}
-			ctx.JSON(200, withResolvedImage(app))
+			// DB update succeeded; now clean up the previous image file.
+			if oldImage != "" {
+				os.Remove(a.ImageDir + oldImage)
+			}
+			ctx.JSON(200, a.resolveImage(app))
 		} else {
 			ctx.AbortWithError(404, fmt.Errorf("app with id %d doesn't exists", id))
 		}
@@ -435,19 +440,19 @@ func (a *ApplicationAPI) RemoveApplicationImage(ctx *gin.Context) {
 				return
 			}
 			os.Remove(a.ImageDir + image)
-			ctx.JSON(200, withResolvedImage(app))
+			ctx.JSON(200, a.resolveImage(app))
 		} else {
 			ctx.AbortWithError(404, fmt.Errorf("app with id %d doesn't exists", id))
 		}
 	})
 }
 
-func withResolvedImage(app *model.Application) *model.Application {
-	if app.Image == "" {
+func (a *ApplicationAPI) resolveImage(app *model.Application) *model.Application {
+	if app.Image != "" && exist(a.ImageDir+app.Image) {
+		app.Image = "image/" + app.Image
+	} else {
 		// This must stay in sync with the isDefaultImage check in ui/src/application/Applications.tsx.
 		app.Image = "static/defaultapp.png"
-	} else {
-		app.Image = "image/" + app.Image
 	}
 	return app
 }
