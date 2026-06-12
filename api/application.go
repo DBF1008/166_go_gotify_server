@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,6 +30,12 @@ type ApplicationDatabase interface {
 type ApplicationAPI struct {
 	DB       ApplicationDatabase
 	ImageDir string
+}
+
+// saveUploadedFile persists an uploaded multipart file to disk. It is declared
+// as a package-level variable so tests can simulate a failing file system.
+var saveUploadedFile = func(ctx *gin.Context, file *multipart.FileHeader, dst string) error {
+	return ctx.SaveUploadedFile(file, dst)
 }
 
 // Application Params Model
@@ -357,19 +364,30 @@ func (a *ApplicationAPI) UploadApplicationImage(ctx *gin.Context) {
 				return generateImageName() + ext
 			})
 
-			err = ctx.SaveUploadedFile(file, a.ImageDir+name)
-			if err != nil {
+			if err := saveUploadedFile(ctx, file, a.ImageDir+name); err != nil {
+				// Saving may have created a partial file; remove it so a failed
+				// upload never leaks an orphaned image onto disk.
+				os.Remove(a.ImageDir + name)
 				ctx.AbortWithError(500, err)
 				return
 			}
 
-			if app.Image != "" {
-				os.Remove(a.ImageDir + app.Image)
+			// Persist the new image name before deleting the previous file. Only
+			// once the database update has succeeded is it safe to drop the old
+			// image. If the update fails we roll back by removing the freshly
+			// uploaded file, leaving the existing image and database record
+			// untouched so the listing never points at a missing file.
+			oldImage := app.Image
+			app.Image = name
+			if err := a.DB.UpdateApplication(app); err != nil {
+				os.Remove(a.ImageDir + name)
+				app.Image = oldImage
+				ctx.AbortWithError(500, err)
+				return
 			}
 
-			app.Image = name
-			if success := successOrAbort(ctx, 500, a.DB.UpdateApplication(app)); !success {
-				return
+			if oldImage != "" {
+				os.Remove(a.ImageDir + oldImage)
 			}
 			ctx.JSON(200, withResolvedImage(app))
 		} else {

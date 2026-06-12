@@ -711,3 +711,237 @@ func fakeImage(t *testing.T, path string) {
 	err = os.WriteFile(path, data, 0o644)
 	assert.Nil(t, err)
 }
+
+// erroringApplicationDB wraps an ApplicationDatabase and lets individual write
+// operations be forced to fail, so the persistence-rollback paths of the image
+// handlers can be exercised.
+type erroringApplicationDB struct {
+	ApplicationDatabase
+	updateErr error
+	deleteErr error
+}
+
+func (e *erroringApplicationDB) UpdateApplication(app *model.Application) error {
+	if e.updateErr != nil {
+		return e.updateErr
+	}
+	return e.ApplicationDatabase.UpdateApplication(app)
+}
+
+func (e *erroringApplicationDB) DeleteApplicationByID(id uint) error {
+	if e.deleteErr != nil {
+		return e.deleteErr
+	}
+	return e.ApplicationDatabase.DeleteApplicationByID(id)
+}
+
+func (s *ApplicationSuite) uploadImageRequest(id string) {
+	cType, buffer, err := upload(map[string]*os.File{"file": mustOpen("../test/assets/image.png")})
+	assert.Nil(s.T(), err)
+	s.ctx.Request = httptest.NewRequest("POST", "/irrelevant", &buffer)
+	s.ctx.Request.Header.Set("Content-Type", cType)
+	test.WithUser(s.ctx, 5)
+	s.ctx.Params = gin.Params{{Key: "id", Value: id}}
+}
+
+// When the database update fails while replacing an image, the freshly uploaded
+// file must be removed and the previous image (file and db record) kept, so the
+// listing never ends up referencing a deleted file.
+func (s *ApplicationSuite) Test_UploadAppImage_DatabaseUpdateFails_rollsBackNewFileAndKeepsOld() {
+	existingImage := "existing.png"
+	newImage := firstApplicationToken[1:] + ".png"
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: existingImage})
+	fakeImage(s.T(), existingImage)
+	defer os.Remove(existingImage)
+	defer os.Remove(newImage)
+
+	s.a.DB = &erroringApplicationDB{ApplicationDatabase: s.db, updateErr: errors.New("update failed")}
+	s.uploadImageRequest("1")
+
+	s.a.UploadApplicationImage(s.ctx)
+
+	assert.Equal(s.T(), 500, s.recorder.Code)
+
+	_, err := os.Stat(newImage)
+	assert.True(s.T(), os.IsNotExist(err), "newly uploaded file must be rolled back on db failure")
+
+	_, err = os.Stat(existingImage)
+	assert.NoError(s.T(), err, "previous image file must be preserved on db failure")
+
+	if app, err := s.db.GetApplicationByID(1); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), existingImage, app.Image, "db must still reference the previous image")
+	}
+}
+
+// When the database update fails on the very first upload, the app keeps no
+// image so it still falls back to the default icon rather than a dead path.
+func (s *ApplicationSuite) Test_UploadAppImage_DatabaseUpdateFails_keepsDefaultImageFallback() {
+	newImage := firstApplicationToken[1:] + ".png"
+	s.db.User(5).App(1)
+	defer os.Remove(newImage)
+
+	s.a.DB = &erroringApplicationDB{ApplicationDatabase: s.db, updateErr: errors.New("update failed")}
+	s.uploadImageRequest("1")
+
+	s.a.UploadApplicationImage(s.ctx)
+
+	assert.Equal(s.T(), 500, s.recorder.Code)
+
+	_, err := os.Stat(newImage)
+	assert.True(s.T(), os.IsNotExist(err), "newly uploaded file must be rolled back on db failure")
+
+	if app, err := s.db.GetApplicationByID(1); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), "", app.Image, "db image must stay empty on db failure")
+		assert.Equal(s.T(), "static/defaultapp.png", withResolvedImage(app).Image)
+	}
+}
+
+// When saving the uploaded file fails, the database record and the previously
+// stored image file must be untouched, and any partially written file must be
+// cleaned up so no orphan is left behind.
+func (s *ApplicationSuite) Test_UploadAppImage_FileSaveFails_keepsDatabaseAndOldFile() {
+	existingImage := "existing.png"
+	newImage := firstApplicationToken[1:] + ".png"
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: existingImage})
+	fakeImage(s.T(), existingImage)
+	defer os.Remove(existingImage)
+	defer os.Remove(newImage)
+
+	original := saveUploadedFile
+	saveUploadedFile = func(ctx *gin.Context, file *multipart.FileHeader, dst string) error {
+		// Simulate a partially written file followed by a write failure.
+		os.WriteFile(dst, []byte("partial"), 0o644)
+		return errors.New("simulated disk failure")
+	}
+	defer func() { saveUploadedFile = original }()
+
+	s.uploadImageRequest("1")
+	s.a.UploadApplicationImage(s.ctx)
+
+	assert.Equal(s.T(), 500, s.recorder.Code)
+
+	_, err := os.Stat(newImage)
+	assert.True(s.T(), os.IsNotExist(err), "partially written upload must be removed on save failure")
+
+	if app, err := s.db.GetApplicationByID(1); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), existingImage, app.Image, "db must keep the previous image on save failure")
+	}
+	_, err = os.Stat(existingImage)
+	assert.NoError(s.T(), err, "previous image file must be preserved on save failure")
+}
+
+// Replacing an image several times must always delete the previous file and
+// leave exactly the latest one on disk, and the response must reflect it.
+func (s *ApplicationSuite) Test_UploadAppImage_RepeatedReplacement_keepsOnlyLatestFile() {
+	s.db.User(5).App(1)
+
+	firstImage := firstApplicationToken[1:] + ".png"
+	secondImage := secondApplicationToken[1:] + ".png"
+	defer os.Remove(firstImage)
+	defer os.Remove(secondImage)
+
+	doUpload := func() {
+		s.recorder = httptest.NewRecorder()
+		s.ctx, _ = gin.CreateTestContext(s.recorder)
+		withURL(s.ctx, "http", "example.com")
+		s.uploadImageRequest("1")
+		s.a.UploadApplicationImage(s.ctx)
+	}
+
+	doUpload()
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	if app, err := s.db.GetApplicationByID(1); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), firstImage, app.Image)
+	}
+	_, statErr := os.Stat(firstImage)
+	assert.NoError(s.T(), statErr, "first image must exist after first upload")
+
+	doUpload()
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	if app, err := s.db.GetApplicationByID(1); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), secondImage, app.Image)
+	}
+	assert.Contains(s.T(), s.recorder.Body.String(), "image/"+secondImage,
+		"response must reference the latest image")
+
+	_, firstErr := os.Stat(firstImage)
+	assert.True(s.T(), os.IsNotExist(firstErr), "previous image must be removed after replacement")
+	_, secondErr := os.Stat(secondImage)
+	assert.NoError(s.T(), secondErr, "latest image must remain on disk")
+}
+
+// Removing an image must clear the db record and report the default icon as the
+// resolved image.
+func (s *ApplicationSuite) Test_RemoveAppImage_fallsBackToDefaultImage() {
+	imageFile := "existing.png"
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: imageFile})
+	fakeImage(s.T(), imageFile)
+	defer os.Remove(imageFile)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("DELETE", "/irrelevant", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	s.a.RemoveApplicationImage(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	_, err := os.Stat(imageFile)
+	assert.True(s.T(), os.IsNotExist(err), "image file must be removed")
+
+	if app, err := s.db.GetApplicationByID(1); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), "", app.Image)
+	}
+	assert.Contains(s.T(), s.recorder.Body.String(), "static/defaultapp.png",
+		"response must fall back to the default icon")
+}
+
+// When the database update fails while removing an image, the file and the db
+// record must both be left intact.
+func (s *ApplicationSuite) Test_RemoveAppImage_DatabaseUpdateFails_keepsFileAndRecord() {
+	imageFile := "existing.png"
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: imageFile})
+	fakeImage(s.T(), imageFile)
+	defer os.Remove(imageFile)
+
+	s.a.DB = &erroringApplicationDB{ApplicationDatabase: s.db, updateErr: errors.New("update failed")}
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("DELETE", "/irrelevant", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	s.a.RemoveApplicationImage(s.ctx)
+
+	assert.Equal(s.T(), 500, s.recorder.Code)
+
+	_, err := os.Stat(imageFile)
+	assert.NoError(s.T(), err, "image file must be preserved on db failure")
+	if app, err := s.db.GetApplicationByID(1); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), imageFile, app.Image, "db must still reference the image on db failure")
+	}
+}
+
+// When deleting the application fails in the database, the app and its image
+// file must both remain.
+func (s *ApplicationSuite) Test_DeleteApplication_DatabaseFails_keepsAppAndImage() {
+	imageFile := "existing.png"
+	s.db.User(5)
+	s.db.CreateApplication(&model.Application{UserID: 5, ID: 1, Image: imageFile})
+	fakeImage(s.T(), imageFile)
+	defer os.Remove(imageFile)
+
+	s.a.DB = &erroringApplicationDB{ApplicationDatabase: s.db, deleteErr: errors.New("delete failed")}
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("DELETE", "/irrelevant", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	s.a.DeleteApplication(s.ctx)
+
+	assert.Equal(s.T(), 500, s.recorder.Code)
+
+	_, err := os.Stat(imageFile)
+	assert.NoError(s.T(), err, "image file must be preserved when delete fails")
+	s.db.AssertAppExist(1)
+}
