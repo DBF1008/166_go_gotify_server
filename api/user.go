@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gotify/server/v2/auth"
@@ -140,7 +139,7 @@ func (a *UserAPI) GetCurrentUser(ctx *gin.Context) {
 	client := auth.GetClient(ctx)
 	if client != nil {
 		result.ClientID = client.ID
-		if client.ElevatedUntil != nil && time.Now().Before(*client.ElevatedUntil) {
+		if client.IsElevatedAt(timeNow()) {
 			result.ElevatedUntil = client.ElevatedUntil
 		}
 	}

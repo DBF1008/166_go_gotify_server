@@ -68,3 +68,10 @@ func (c *Client) calculateExpiresAt() *time.Time {
 	expiry := reference.Add(time.Duration(c.ExpiresAfterInactivitySeconds) * time.Second)
 	return &expiry
 }
+
+// IsElevatedAt reports whether the client session is elevated at the given time.
+// A session is elevated while now is strictly before ElevatedUntil; a nil
+// ElevatedUntil is never elevated.
+func (c *Client) IsElevatedAt(now time.Time) bool {
+	return c.ElevatedUntil != nil && now.Before(*c.ElevatedUntil)
+}

@@ -338,7 +338,7 @@ func (s *AuthenticationSuite) assertCookieRequest(token string, f fMiddleware, c
 	recorder := httptest.NewRecorder()
 	ctx, _ = gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest("GET", "/", nil)
-	ctx.Request.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+	ctx.Request.AddCookie(&http.Cookie{Name: CookieName, Value: token})
 	f(ctx)
 	assert.Equal(s.T(), code, recorder.Code)
 	return ctx

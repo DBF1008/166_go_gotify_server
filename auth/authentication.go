@@ -19,10 +19,7 @@ const (
 	authStateOk
 )
 
-const (
-	headerName = "X-Gotify-Key"
-	cookieName = "gotify-client-token"
-)
+const headerName = "X-Gotify-Key"
 
 var timeNow = time.Now
 
@@ -221,7 +218,7 @@ func (a *Auth) readTokenFromRequest(ctx *gin.Context) (string, bool) {
 }
 
 func (a *Auth) tokenFromCookie(ctx *gin.Context) string {
-	token, err := ctx.Cookie(cookieName)
+	token, err := ctx.Cookie(CookieName)
 	if err != nil {
 		return ""
 	}
@@ -261,7 +258,7 @@ func (a *Auth) checkClientAdmin(client *model.Client) (authState, error) {
 }
 
 func (a *Auth) checkClientElevated(client *model.Client) (authState, error) {
-	if client.ElevatedUntil == nil || !timeNow().Before(*client.ElevatedUntil) {
+	if !client.IsElevatedAt(timeNow()) {
 		return authStateNotElevated, nil
 	}
 	return authStateOk, nil
